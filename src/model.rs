@@ -40,6 +40,8 @@ pub struct TaskRow {
     pub blocking: bool,
     pub state: TaskState,
     pub timing: Timing,
+    #[serde(default)]
+    pub stats_available: bool,
     pub wakes: u64,
     pub self_wakes: u64,
     pub waker_clones: u64,
@@ -520,6 +522,8 @@ impl Accumulator {
                 };
                 let mut row = TaskRow {
                     id,
+                    stats_available: stats.created_at.as_ref().and_then(timestamp).is_some()
+                        && stats.poll_stats.is_some(),
                     name: fields
                         .get("task.name")
                         .cloned()

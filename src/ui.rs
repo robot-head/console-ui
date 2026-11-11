@@ -924,6 +924,9 @@ impl Console {
             back(context),
             title(&format!("{}  /  task {id}", task.name), 26.0).into(),
         ];
+        if !task.stats_available {
+            content.push(note("Task statistics are incomplete at this position; zero counters are not complete evidence."));
+        }
         for evidence in crate::analysis::evidence(task, &self.settings) {
             content.push(note(&format!(
                 "{}: observed {}; threshold {}. {}",

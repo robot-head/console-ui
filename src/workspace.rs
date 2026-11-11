@@ -33,6 +33,7 @@ pub struct TabDocument {
     pub target: String,
     pub recording: Option<PathBuf>,
     pub filter: String,
+    pub graph_filter: String,
     pub tables: BTreeMap<String, TablePreferences>,
     pub view: Option<InvestigationView>,
     pub histogram_policy: HistogramPolicy,
@@ -46,6 +47,7 @@ impl Default for TabDocument {
             target: Settings::default().target,
             recording: None,
             filter: String::new(),
+            graph_filter: String::new(),
             tables: BTreeMap::new(),
             view: None,
             histogram_policy: Default::default(),
@@ -63,10 +65,40 @@ pub struct Tab {
     pub investigation: Option<Investigation>,
     pub window_ns: Option<u64>,
     pub policy: HistogramPolicy,
+    pub comparison: Option<Comparison>,
+    comparison_generation: u64,
     last_session: u64,
     seek_generation: u64,
     seeking: bool,
     seek_request: Option<(usize, u64)>,
+    applied_cursor: Option<u64>,
+    seek_selection: Option<(String, u64)>,
+}
+impl Tab {
+    fn saved_view(&self, name: String) -> Result<InvestigationView> {
+        let live = self.worker.read();
+        let cursor = self.applied_cursor.unwrap_or(live.snapshot.now);
+        let view = InvestigationView {
+            name,
+            recording: self.document.recording.clone(),
+            session: live.session.saturating_sub(1) as usize,
+            cursor,
+            range: self
+                .window_ns
+                .map(|ns| [cursor.saturating_sub(ns), cursor])
+                .filter(|r| r[1] > r[0]),
+            filter: self.document.filter.clone(),
+            graph_filter: self.document.graph_filter.clone(),
+            tables: self.document.tables.clone(),
+            selected: self
+                .selection
+                .as_ref()
+                .filter(|s| s.session == live.session)
+                .map(|s| (s.kind.clone(), s.id)),
+        };
+        view.validate()?;
+        Ok(view)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceDocument {
@@ -84,7 +116,12 @@ enum Job {
         tab: u64,
         message: String,
     },
-    Compared(Box<Comparison>),
+    Compared {
+        tab: u64,
+        session: usize,
+        generation: u64,
+        comparison: Box<Comparison>,
+    },
     Seeked {
         tab: u64,
         generation: u64,
@@ -92,6 +129,7 @@ enum Job {
     },
 }
 struct Seeked {
+    cursor: u64,
     recording: Recording,
     snapshot: Snapshot,
     history: History,
@@ -114,7 +152,6 @@ pub struct Workspace {
     pub views: Vec<InvestigationView>,
     pub project_policy: ProjectPolicy,
     pub notice: Option<String>,
-    pub comparison: Option<Comparison>,
     pub pending: usize,
     pub report_sections: Vec<String>,
     preview_policy: Option<RedactionPolicy>,
@@ -165,6 +202,9 @@ pub enum Action {
     Disconnect,
     Pause,
     Filter {
+        expression: String,
+    },
+    GraphFilter {
         expression: String,
     },
     Select {
@@ -403,7 +443,6 @@ impl Workspace {
                 presets: vec![],
             },
             notice: None,
-            comparison: None,
             pending: 0,
             report_sections: crate::sharing::default_report_sections(),
             preview_policy: None,
@@ -487,10 +526,14 @@ impl Workspace {
             investigation: None,
             window_ns: None,
             policy: self.preferences.histogram_policy.clone(),
+            comparison: None,
+            comparison_generation: 0,
             last_session: 0,
             seek_generation: 0,
             seeking: false,
             seek_request: None,
+            applied_cursor: None,
+            seek_selection: None,
         });
         self.active = id;
         self.current()
@@ -517,6 +560,9 @@ impl Workspace {
                 tables: restore
                     .as_ref()
                     .map_or(self.preferences.tables.clone(), |v| v.tables.clone()),
+                graph_filter: restore
+                    .as_ref()
+                    .map_or(String::new(), |v| v.graph_filter.clone()),
                 view: restore.clone(),
                 histogram_policy: Default::default(),
                 active_preset: None,
@@ -529,10 +575,14 @@ impl Workspace {
             investigation: None,
             window_ns: None,
             policy: HistogramPolicy::default(),
+            comparison: None,
+            comparison_generation: 0,
             last_session: 0,
             seek_generation: 0,
             seeking: false,
             seek_request: None,
+            applied_cursor: None,
+            seek_selection: None,
         });
         self.active = tab;
         self.pending += 1;
@@ -592,9 +642,22 @@ impl Workspace {
             self.pending = self.pending.saturating_sub(1);
             match result {
                 Ok(Job::Finished(message)) => self.notice = Some(message),
-                Ok(Job::Compared(comparison)) => {
-                    self.comparison = Some(*comparison);
-                    self.notice = Some("Capture comparison complete".into());
+                Ok(Job::Compared {
+                    tab,
+                    session,
+                    generation,
+                    comparison,
+                }) => {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.document.id == tab)
+                        && tab.comparison_generation == generation
+                        && tab.playback.as_ref().is_some_and(|p| p.session == session)
+                    {
+                        tab.comparison = Some(*comparison);
+                        self.notice = Some(format!(
+                            "Capture comparison complete for {}",
+                            tab.document.name
+                        ));
+                    }
                 }
                 Ok(Job::OpenFailed { tab, message }) => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.document.id == tab) {
@@ -616,13 +679,47 @@ impl Workspace {
                                     state.snapshot = Arc::new(result.snapshot);
                                     state.session = result.session as u64 + 1;
                                     state.error = None;
+                                    target.applied_cursor = Some(result.cursor);
+                                    target.last_session = state.session;
+                                    if target
+                                        .selection
+                                        .as_ref()
+                                        .is_some_and(|s| s.session != state.session)
+                                    {
+                                        target.selection = None;
+                                    }
+                                    if let Some((kind, id)) = target.seek_selection.take() {
+                                        let exists = match kind.as_str() {
+                                            "task" => {
+                                                state.snapshot.tasks.iter().any(|t| t.id == id)
+                                            }
+                                            "resource" => {
+                                                state.snapshot.resources.iter().any(|r| r.id == id)
+                                            }
+                                            _ => false,
+                                        };
+                                        if exists {
+                                            target.selection = Some(Selection {
+                                                kind,
+                                                id,
+                                                session: state.session,
+                                            });
+                                        } else {
+                                            self.notice = Some("The bookmarked entity is not retained at this recording position".into());
+                                        }
+                                    }
                                     target.history = result.history;
                                     target.recording = Some(result.recording);
                                 }
                                 Err(error) => {
+                                    let actual =
+                                        target.worker.read().session.saturating_sub(1) as usize;
                                     if let Some(p) = &mut target.playback {
                                         p.playing = false;
+                                        p.session = actual;
+                                        p.seek(target.applied_cursor.unwrap_or_default());
                                     }
+                                    target.seek_selection = None;
                                     self.notice = Some(format!("Seek recording: {error:#}"));
                                 }
                             }
@@ -655,6 +752,7 @@ impl Workspace {
                         target.last_session = session as u64 + 1;
                         target.history = history;
                         target.playback = Some(Playback::new(session, cursor));
+                        target.applied_cursor = Some(cursor);
                         target.window_ns = restore
                             .as_ref()
                             .and_then(|v| v.range.map(|r| r[1].saturating_sub(r[0])));
@@ -666,9 +764,10 @@ impl Workspace {
                             let live = target.worker.read();
                             let exists = if kind == "task" {
                                 live.snapshot.tasks.iter().any(|t| t.id == id)
-                            } else {
-                                missing_selection = true;
+                            } else if kind == "resource" {
                                 live.snapshot.resources.iter().any(|r| r.id == id)
+                            } else {
+                                live.snapshot.async_ops.iter().any(|o| o.id == id)
                             };
                             if exists {
                                 target.selection = Some(Selection {
@@ -677,6 +776,7 @@ impl Workspace {
                                     session: live.session,
                                 });
                             } else {
+                                missing_selection = true;
                                 self.notice = Some(
                                     "The saved entity is not retained at this recording position"
                                         .into(),
@@ -718,6 +818,7 @@ impl Workspace {
                         let history =
                             recording.extend_history(history, session, cursor, &settings)?;
                         Ok(Box::new(Seeked {
+                            cursor,
                             recording,
                             snapshot,
                             history,
@@ -797,9 +898,12 @@ impl Workspace {
         let playback = tab.playback.as_mut().unwrap();
         if playback.session != session {
             tab.selection = None;
+            tab.comparison = None;
+            tab.comparison_generation += 1;
         }
         playback.session = session;
         playback.seek(cursor);
+        tab.seek_selection = None;
         tab.seek_generation += 1;
         tab.seek_request = Some((session, cursor));
         Ok(())
@@ -937,6 +1041,10 @@ impl Workspace {
                 );
                 worker.send(Command::Pause(!live.paused));
                 self.notice = Some("Pause/resume changes the subscriber server and affects every observer of this endpoint, including duplicate target tabs".into());
+            }
+            Action::GraphFilter { expression } => {
+                Query::parse(&expression)?;
+                self.current_mut().document.graph_filter = expression;
             }
             Action::Filter { expression } => {
                 Query::parse(&expression)?;
@@ -1203,13 +1311,15 @@ impl Workspace {
             }
             Action::Bookmark { name, note } => {
                 ensure!(!name.trim().is_empty(), "Bookmark needs a name");
-                let p = self
-                    .current()
-                    .playback
+                let tab = self.current();
+                let cursor = tab.applied_cursor.context("Open a recording")?;
+                let live = tab.worker.read();
+                let session = live.session.saturating_sub(1) as usize;
+                let selected = tab
+                    .selection
                     .as_ref()
-                    .context("Open a recording")?;
-                let (session, cursor) = (p.session, p.cursor);
-                let selected = self.current().selection.clone();
+                    .filter(|s| s.session == live.session)
+                    .cloned();
                 let task = selected.as_ref().filter(|s| s.kind == "task").map(|s| s.id);
                 let resource = selected
                     .as_ref()
@@ -1244,32 +1354,14 @@ impl Workspace {
                     .context("Bookmark is unavailable")?
                     .clone();
                 self.seek(b.session, b.cursor)?;
-                if let Some(id) = b.task {
-                    self.select("task".into(), id)?;
-                }
-                if let Some(id) = b.resource {
-                    self.select("resource".into(), id)?;
-                }
+                self.current_mut().seek_selection = b
+                    .resource
+                    .map(|id| ("resource".into(), id))
+                    .or_else(|| b.task.map(|id| ("task".into(), id)));
             }
             Action::SaveView { name } => {
                 ensure!(!name.trim().is_empty(), "View needs a name");
-                let tab = self.current();
-                let playback = tab.playback.as_ref();
-                let view = InvestigationView {
-                    name: name.clone(),
-                    recording: tab.document.recording.clone(),
-                    session: playback.map_or(0, |p| p.session),
-                    cursor: playback.map_or(tab.worker.read().snapshot.now, |p| p.cursor),
-                    range: tab.window_ns.map(|ns| {
-                        [
-                            tab.worker.read().snapshot.now.saturating_sub(ns),
-                            tab.worker.read().snapshot.now,
-                        ]
-                    }),
-                    filter: tab.document.filter.clone(),
-                    tables: tab.document.tables.clone(),
-                    selected: tab.selection.as_ref().map(|s| (s.kind.clone(), s.id)),
-                };
+                let view = self.current().saved_view(name.clone())?;
                 self.views.retain(|v| v.name != name);
                 self.views.push(view.clone());
                 self.preferences.saved_views = self.views.clone();
@@ -1297,6 +1389,8 @@ impl Workspace {
                     self.open_recording(path.clone(), false, Some(view));
                 } else {
                     self.current_mut().document.filter = view.filter;
+                    self.current_mut().document.graph_filter = view.graph_filter;
+                    self.current_mut().window_ns = view.range.map(|r| r[1] - r[0]);
                     self.current_mut().document.tables = view.tables;
                     self.current_mut().selection = None;
                     self.notice=Some("Live view restored; select a current entity to avoid reusing an earlier session's ID".into());
@@ -1330,26 +1424,12 @@ impl Workspace {
                             .iter()
                             .map(|t| {
                                 let mut document = t.document.clone();
-                                if let Some(p) = &t.playback {
-                                    document.view = Some(InvestigationView {
-                                        name: document.name.clone(),
-                                        recording: document.recording.clone(),
-                                        session: p.session,
-                                        cursor: p.cursor,
-                                        range: t
-                                            .window_ns
-                                            .map(|ns| [p.cursor.saturating_sub(ns), p.cursor]),
-                                        filter: document.filter.clone(),
-                                        tables: document.tables.clone(),
-                                        selected: t
-                                            .selection
-                                            .as_ref()
-                                            .map(|s| (s.kind.clone(), s.id)),
-                                    });
+                                if t.playback.is_some() {
+                                    document.view = Some(t.saved_view(document.name.clone())?);
                                 }
-                                document
+                                Ok(document)
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                         policy: ProjectPolicy {
                             schema_version: 1,
                             settings: Some(self.settings.clone()),
@@ -1402,12 +1482,14 @@ impl Workspace {
                         if !restoring {
                             let tab = self.current_mut();
                             tab.document.filter = t.filter;
+                            tab.document.graph_filter = t.graph_filter;
                             tab.document.tables = t.tables;
                         }
                     } else {
                         self.add_target(t.target, t.name, None)?;
                         let tab = self.current_mut();
                         tab.document.filter = t.filter;
+                        tab.document.graph_filter = t.graph_filter;
                         tab.document.tables = t.tables;
                         tab.policy = t.histogram_policy.clone();
                         if tab.policy.mode == "selected" {
@@ -1476,15 +1558,23 @@ impl Workspace {
                     .recording
                     .clone()
                     .context("Open a recording before comparing captures")?;
-                let selected = current
-                    .playback
-                    .as_ref()
-                    .context("Recording is still loading")?
-                    .session;
+                ensure!(
+                    !current.seeking && current.seek_request.is_none(),
+                    "Wait for the recording seek before comparing captures"
+                );
+                let selected = current.worker.read().session.saturating_sub(1) as usize;
                 let duration = current.window_ns;
-                let cursor = current.playback.as_ref().unwrap().cursor;
+                let cursor = current
+                    .applied_cursor
+                    .context("Recording is still loading")?;
                 let settings = self.settings.clone();
                 let sender = self.jobs.clone();
+                let tab = self.active;
+                let generation = {
+                    let current = self.current_mut();
+                    current.comparison_generation += 1;
+                    current.comparison_generation
+                };
                 self.pending += 1;
                 self.notice = Some("Comparing captures…".into());
                 std::thread::spawn(move || {
@@ -1511,12 +1601,12 @@ impl Workspace {
                             &settings,
                             duration.map(|ns| [cursor.saturating_sub(ns), cursor]),
                         )?;
-                        Ok(Job::Compared(Box::new(analysis::compare(
-                            &a,
-                            &b,
-                            [sa, sb],
-                            &policy,
-                        )?)))
+                        Ok(Job::Compared {
+                            tab,
+                            session: selected,
+                            generation,
+                            comparison: Box::new(analysis::compare(&a, &b, [sa, sb], &policy)?),
+                        })
                     })();
                     let _ = sender.send(result);
                 });
@@ -1535,24 +1625,36 @@ impl Workspace {
                 let snapshot = Query::parse(&tab.document.filter)?.filter(&live.snapshot);
                 let mut document = ExportDocument::new(live.session, Some(live.target), snapshot);
                 document.sections = self.report_sections.clone();
+                document.chart_task = tab
+                    .selection
+                    .as_ref()
+                    .filter(|s| s.kind == "task" && s.session == live.session)
+                    .map(|s| s.id);
+                let cursor = tab.applied_cursor.unwrap_or(live.snapshot.now);
                 document.range = tab
                     .window_ns
-                    .map(|ns| [live.snapshot.now.saturating_sub(ns), live.snapshot.now]);
+                    .map(|ns| [cursor.saturating_sub(ns), cursor])
+                    .filter(|r| r[1] > r[0]);
                 document.notes.push("Table and inspector counters are lifetime values at the cursor. The selected range scopes trend charts and window summaries; it does not change lifetime counters.".into());
                 let document = redaction.document(&document);
+                let chart_task = document.chart_task;
                 let points = tab
                     .history
-                    .points()
+                    .points_for(chart_task)
                     .into_iter()
                     .filter(|p| {
-                        p.now <= live.snapshot.now && document.range.is_none_or(|r| p.now >= r[0])
+                        tab.history
+                            .bounds()
+                            .is_some_and(|(session, _, _)| session == live.session)
+                            && p.now <= cursor
+                            && document.range.is_none_or(|r| p.now >= r[0])
                     })
                     .collect::<Vec<_>>();
                 let comparison = if redaction.fields.is_empty()
                     && !redaction.source_paths
                     && !redaction.endpoints
                 {
-                    self.comparison.clone()
+                    tab.comparison.clone()
                 } else {
                     None
                 };
@@ -1563,7 +1665,8 @@ impl Workspace {
                         "html" => document.report(&path, &points, comparison.as_ref())?,
                         "svg" => preferences::atomic_write(
                             &path,
-                            crate::sharing::chart_svg(&points, &table)?.as_bytes(),
+                            crate::sharing::chart_svg_scoped(&points, &table, chart_task)?
+                                .as_bytes(),
                         )?,
                         _ => anyhow::bail!("Unknown export format"),
                     };
@@ -1595,7 +1698,17 @@ impl Workspace {
             .as_ref()
             .filter(|s| s.session == live.session)
             .cloned();
-        let focus = selected.as_ref().map(|s| format!("{}:{}", s.kind, s.id));
+        let focus = selected.as_ref().and_then(|s| {
+            if s.kind == "operation" {
+                live.snapshot
+                    .async_ops
+                    .iter()
+                    .find(|o| o.id == s.id)
+                    .map(|o| format!("resource:{}", o.resource_id))
+            } else {
+                Some(format!("{}:{}", s.kind, s.id))
+            }
+        });
         let mut inspection = (*live.snapshot).clone();
         inspection.tasks.retain(|t| {
             selected
@@ -1622,7 +1735,12 @@ impl Workspace {
             doc.sections = self.report_sections.clone();
             policy.document(&doc)
         });
-        let evidence = snapshot
+        let evidence_source = if selected.as_ref().is_some_and(|s| s.kind == "task") {
+            &live.snapshot
+        } else {
+            &snapshot
+        };
+        let evidence = evidence_source
             .tasks
             .iter()
             .filter(|t| {
@@ -1640,6 +1758,8 @@ impl Workspace {
                 }
             }
         }
+        let chart_task = selected.as_ref().filter(|s| s.kind == "task").map(|s| s.id);
+        let cursor = tab.applied_cursor.unwrap_or(live.snapshot.now);
         Ok(View {
             name: self.name.clone(),
             inspection,
@@ -1686,31 +1806,34 @@ impl Workspace {
             selection: selected,
             trends: tab
                 .history
-                .points_for(
-                    tab.selection
-                        .as_ref()
-                        .filter(|s| s.kind == "task")
-                        .map(|s| s.id),
-                )
+                .points_for(chart_task)
                 .into_iter()
                 .filter(|p| {
-                    p.now <= live.snapshot.now
+                    tab.history
+                        .bounds()
+                        .is_some_and(|(session, _, _)| session == live.session)
+                        && p.now <= cursor
                         && tab
                             .window_ns
-                            .is_none_or(|ns| p.now >= live.snapshot.now.saturating_sub(ns))
+                            .is_none_or(|ns| p.now >= cursor.saturating_sub(ns))
                 })
                 .collect(),
             window: tab.window_ns.map(|ns| {
                 tab.history
                     .window(&live.snapshot, live.snapshot.now.saturating_sub(ns))
             }),
-            graph: analysis::contention_graph(&snapshot, focus.as_deref(), 300),
+            graph: analysis::contention_graph_filtered(
+                &live.snapshot,
+                focus.as_deref(),
+                300,
+                &Query::parse(&tab.document.graph_filter)?,
+            ),
             evidence,
             sessions: tab
                 .recording
                 .as_ref()
                 .map_or(vec![], |r| r.sessions.clone()),
-            cursor: tab.playback.as_ref().map(|p| p.cursor),
+            cursor: tab.applied_cursor,
             playing: tab.playback.as_ref().is_some_and(|p| p.playing),
             speed: tab.playback.as_ref().map_or(1.0, |p| p.speed),
             bookmarks: tab
@@ -1719,7 +1842,7 @@ impl Workspace {
                 .map_or(vec![], |i| i.bookmarks.clone()),
             views,
             preferences: self.effective_preferences()?,
-            comparison: self.comparison.clone(),
+            comparison: tab.comparison.clone(),
             notice: self.notice.clone().or(live.error).or(live.notice),
             pending: self.pending,
             snapshot,

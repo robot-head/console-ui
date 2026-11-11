@@ -926,3 +926,193 @@ fn path_redaction_covers_formatted_attributes_and_policy_query_metadata() {
         String::from_utf8_lossy(&std::fs::read(&original).unwrap()).contains("/private/project.rs")
     );
 }
+
+#[test]
+fn missing_task_counters_are_unavailable_instead_of_a_zero_budget_pass() {
+    let mut accumulator = Accumulator::default();
+    accumulator.apply(instrument::Update {
+        now: ts(100),
+        task_update: Some(tasks::TaskUpdate {
+            new_tasks: vec![tasks::Task {
+                id: Some(api::Id { id: 1 }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let snapshot = accumulator.snapshot(&Settings::default().warnings);
+    assert!(!snapshot.tasks[0].stats_available);
+    let rules:Rules=serde_json::from_value(serde_json::json!({"schema_version":1,"rules":[{"name":"busy budget","query":"","metric":"busy_ns","maximum":1000}]})).unwrap();
+    assert_eq!(
+        rules.evaluate(&snapshot, false).unwrap().exit_code,
+        EXIT_UNAVAILABLE
+    );
+    assert!(analysis::interval(&snapshot, &sample(102, 2, 2)).1);
+}
+
+#[test]
+fn comparison_and_saved_graph_state_stay_with_their_recording_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("capture.tcui");
+    let mut writer = Recorder::create(&path).unwrap();
+    writer.session("http://localhost:6669").unwrap();
+    writer.update(&update(100, 1, 1, "worker")).unwrap();
+    writer.update(&update(110, 11, 11, "worker")).unwrap();
+    writer.details(&detail(111)).unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    assert_eq!(
+        console_ui::automation::capture_window(&path, 0, &Settings::default())
+            .unwrap()
+            .1,
+        10.0,
+        "Normalize counter rates by actual sample times, not a later histogram timestamp"
+    );
+    let mut app = Workspace::with_preferences(
+        Settings::default(),
+        dir.path().join("prefs.json"),
+        None,
+        Some(path.clone()),
+    )
+    .unwrap();
+    wait_for_jobs(&mut app);
+    let source = app.active;
+    app.dispatch(Action::GraphFilter {
+        expression: "type:Mutex".into(),
+    })
+    .unwrap();
+    app.dispatch(Action::SaveView {
+        name: "graph".into(),
+    })
+    .unwrap();
+    app.dispatch(Action::Compare {
+        path: path.clone(),
+        session: 0,
+        policy: Default::default(),
+    })
+    .unwrap();
+    app.dispatch(Action::AddTarget {
+        target: "http://127.0.0.1:9".into(),
+        name: "other".into(),
+    })
+    .unwrap();
+    wait_for_jobs(&mut app);
+    assert!(app.view().unwrap().comparison.is_none());
+    app.dispatch(Action::SelectTab { id: source }).unwrap();
+    assert!(app.view().unwrap().comparison.is_some());
+    app.dispatch(Action::LoadView {
+        name: "graph".into(),
+    })
+    .unwrap();
+    wait_for_jobs(&mut app);
+    assert_eq!(app.current().document.graph_filter, "type:Mutex");
+    assert!(app.view().unwrap().comparison.is_none());
+}
+
+#[test]
+fn task_chart_scope_and_graph_neighbor_filter_preserve_supporting_context() {
+    let mut snapshot = sample(101, 1, 1);
+    snapshot.resources.push(console_ui::model::ResourceRow {
+        id: 2,
+        kind: "Sync".into(),
+        concrete_type: "Mutex".into(),
+        target: String::new(),
+        location: String::new(),
+        attributes: String::new(),
+        internal: false,
+        parent: None,
+        total: 1,
+        completed: false,
+    });
+    snapshot.async_ops.push(console_ui::model::AsyncOpRow {
+        id: 3,
+        resource_id: 2,
+        task_id: Some(1),
+        task_name: "worker".into(),
+        source: "lock".into(),
+        attributes: String::new(),
+        timing: Default::default(),
+        completed: false,
+        ready: Some(false),
+    });
+    let graph = analysis::contention_graph_filtered(
+        &snapshot,
+        Some("task:1"),
+        8,
+        &Query::parse("entity:resource type:Mutex").unwrap(),
+    );
+    assert_eq!(graph.edges.len(), 1);
+    assert_eq!(graph.nodes.len(), 2);
+    let svg = console_ui::sharing::chart_svg_scoped(&[], "busy", Some(1)).unwrap();
+    assert!(svg.contains("task 1"));
+    assert!(svg.contains("No interval samples"));
+}
+
+#[test]
+fn asynchronous_bookmarks_restore_selection_after_the_destination_session_is_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bookmarks.tcui");
+    let mut writer = Recorder::create(&path).unwrap();
+    writer.session("http://first:6669").unwrap();
+    writer.update(&update(100, 1, 1, "first")).unwrap();
+    writer.update(&update(110, 2, 2, "first")).unwrap();
+    writer.session("http://second:6669").unwrap();
+    writer.update(&update(200, 3, 3, "second")).unwrap();
+    writer.details(&detail(205)).unwrap();
+    writer.update(&update(210, 4, 4, "second")).unwrap();
+    drop(writer);
+    let mut app = Workspace::with_preferences(
+        Settings::default(),
+        dir.path().join("prefs.json"),
+        None,
+        Some(path),
+    )
+    .unwrap();
+    wait_for_jobs(&mut app);
+    app.dispatch(Action::Select {
+        kind: "task".into(),
+        id: 1,
+    })
+    .unwrap();
+    app.dispatch(Action::Bookmark {
+        name: "second session".into(),
+        note: String::new(),
+    })
+    .unwrap();
+    let bookmark = app.view().unwrap().bookmarks[0].id;
+    app.dispatch(Action::Session { index: 0 }).unwrap();
+    // The UI must describe the installed snapshot until the asynchronous job commits.
+    assert_eq!(app.view().unwrap().cursor, Some(210_000_000_000));
+    app.dispatch(Action::SaveView {
+        name: "during seek".into(),
+    })
+    .unwrap();
+    let saved = app.views.iter().find(|v| v.name == "during seek").unwrap();
+    assert_eq!((saved.session, saved.cursor), (1, 210_000_000_000));
+    wait_for_jobs(&mut app);
+    assert_eq!(app.view().unwrap().cursor, Some(100_000_000_000));
+    assert!(app.view().unwrap().snapshot.details.is_empty());
+    app.dispatch(Action::GoBookmark { id: bookmark }).unwrap();
+    assert_eq!(app.view().unwrap().cursor, Some(100_000_000_000));
+    app.dispatch(Action::Bookmark {
+        name: "applied first".into(),
+        note: String::new(),
+    })
+    .unwrap();
+    let first = app
+        .view()
+        .unwrap()
+        .bookmarks
+        .into_iter()
+        .find(|b| b.name == "applied first")
+        .unwrap();
+    assert_eq!((first.session, first.cursor), (0, 100_000_000_000));
+    wait_for_jobs(&mut app);
+    let view = app.view().unwrap();
+    assert_eq!(view.cursor, Some(210_000_000_000));
+    assert_eq!(view.snapshot.tasks[0].name, "second");
+    assert!(view.snapshot.details.contains_key(&1));
+    let selection = view.selection.unwrap();
+    assert_eq!((selection.id, selection.session), (1, view.session));
+}

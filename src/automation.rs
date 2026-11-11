@@ -200,10 +200,7 @@ pub fn capture_range(
         start >= selected.start && end <= selected.end && end > start,
         "Comparison range lies outside its session"
     );
-    Ok((
-        recording.window(session, start, end, settings)?,
-        (end - start) as f64 / 1e9,
-    ))
+    recording.window_with_duration(session, start, end, settings)
 }
 pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Result<i32> {
     if let Some(output) = &options.output {
@@ -443,7 +440,8 @@ impl Rules {
         for rule in &self.rules {
             let query = Query::parse(&rule.query)?;
             let selected: Vec<_> = snapshot.tasks.iter().filter(|t| query.task(t)).collect();
-            let mut available = !incomplete && !selected.is_empty();
+            let mut available =
+                !incomplete && !selected.is_empty() && selected.iter().all(|t| t.stats_available);
             let measured = if rule.metric == "warning_tasks" {
                 Some(selected.iter().filter(|t| !t.warnings.is_empty()).count() as f64)
             } else {

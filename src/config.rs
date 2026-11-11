@@ -125,6 +125,8 @@ pub enum Action {
         session: usize,
         #[arg(long)]
         at_ns: Option<u64>,
+        #[arg(long)]
+        chart_task: Option<u64>,
         #[arg(long, value_delimiter = ',')]
         redact_fields: Vec<String>,
         #[arg(long)]

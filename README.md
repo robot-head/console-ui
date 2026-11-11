@@ -193,7 +193,10 @@ console-ui sessions current.tcui
 console-ui compare baseline.tcui current.tcui --output comparison.json
 console-ui check --rules examples/budgets.json --input current.tcui --baseline baseline.tcui --output results.json
 console-ui export current.tcui report.html --format html --query 'name:worker-0'
+console-ui export current.tcui polling.svg --format svg --table polls --chart-task 13
 ```
+
+Replace `13` with the task ID shown by the capture or task inspector.
 
 Capture warms the selected histogram streams before seeding the recording so
 interval percentile checks can subtract baseline counts. `check` can also observe a

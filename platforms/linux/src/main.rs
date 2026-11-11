@@ -1501,6 +1501,9 @@ fn task_order(a: &TaskRow, b: &TaskRow, sort: u32) -> std::cmp::Ordering {
     .then(a.id.cmp(&b.id))
 }
 fn task_details(container: &gtk::Box, t: &TaskRow, s: &Snapshot) {
+    if !t.stats_available {
+        container.append(&label("Task statistics are incomplete at this position."));
+    }
     container.append(&label(&format!("{} / task {}\n{:?}\nTotal {}\nBusy {} ({:.1}%)\nScheduled {} ({:.1}%)\nIdle {}\nPolls {}\nActive wakers {}\nClones {} / drops {}\nWakes {} / self {} ({:.1}%)\nLast woken {}\n{}\n{}",t.name,t.id,t.state,ns(t.timing.total),ns(t.timing.busy),console_ui::model::percent(t.timing.busy,t.timing.total),ns(t.timing.scheduled),console_ui::model::percent(t.timing.scheduled,t.timing.total),ns(t.timing.idle),t.timing.polls,t.active_wakers(),t.waker_clones,t.waker_drops,t.wakes,t.self_wakes,t.self_wake_percent(),t.last_wake_ago.map(ns).unwrap_or_else(||"never".into()),t.location,t.fields)));
     for lint in &t.warnings {
         container.append(&label(&format!("Warning: {}", lint.name())));

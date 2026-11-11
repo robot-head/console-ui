@@ -25,6 +25,8 @@ pub struct ExportDocument {
     pub notes: Vec<String>,
     #[serde(default = "default_report_sections")]
     pub sections: Vec<String>,
+    #[serde(default)]
+    pub chart_task: Option<u64>,
 }
 pub fn default_report_sections() -> Vec<String> {
     ["charts", "tasks", "resources", "comparison"]
@@ -51,6 +53,7 @@ impl ExportDocument {
             snapshot,
             notes: vec![],
             sections: default_report_sections(),
+            chart_task: None,
         }
     }
     pub fn json(&self, path: &Path) -> Result<()> {
@@ -192,7 +195,7 @@ impl ExportDocument {
         }
         if self.sections.iter().any(|s| s == "charts") {
             for metric in ["busy", "scheduled", "polls"] {
-                html.push_str(&chart_svg(points, metric)?);
+                html.push_str(&chart_svg_scoped(points, metric, self.chart_task)?);
             }
         }
         if self.sections.iter().any(|s| s == "tasks") {
@@ -242,6 +245,9 @@ pub fn escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 pub fn chart_svg(points: &[TrendPoint], metric: &str) -> Result<String> {
+    chart_svg_scoped(points, metric, None)
+}
+pub fn chart_svg_scoped(points: &[TrendPoint], metric: &str, task: Option<u64>) -> Result<String> {
     ensure!(
         ["polls", "busy", "scheduled"].contains(&metric),
         "Unknown chart metric"
@@ -259,13 +265,20 @@ pub fn chart_svg(points: &[TrendPoint], metric: &str) -> Result<String> {
     let end = points.last().map_or(first, |p| p.now);
     let span = end.saturating_sub(first).max(1) as f64;
     let mut svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 800 240\" role=\"img\" aria-label=\"{metric} trend\"><rect width=\"800\" height=\"240\" fill=\"white\"/><text x=\"40\" y=\"20\" font-size=\"14\">{metric} {} · max {max:.2}</text><path d=\"M40 30V210H780\" stroke=\"black\" fill=\"none\"/>",
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 800 240\" role=\"img\" aria-label=\"{metric} trend\"><rect width=\"800\" height=\"240\" fill=\"white\"/><text x=\"40\" y=\"20\" font-size=\"14\">{metric} {} · {} · max {max:.2}</text><path d=\"M40 30V210H780\" stroke=\"black\" fill=\"none\"/>",
         if metric == "polls" {
             "polls/s"
         } else {
             "ns/interval"
-        }
+        },
+        task.map_or_else(
+            || "retained task aggregate".into(),
+            |id| format!("task {id}")
+        )
     );
+    if points.is_empty() {
+        svg.push_str("<text x=\"100\" y=\"110\">No interval samples available</text>");
+    }
     let mut segment = String::new();
     for (point, value) in points.iter().zip(values) {
         let x = 40.0 + (point.now.saturating_sub(first) as f64 / span) * 740.0;

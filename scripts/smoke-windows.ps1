@@ -59,7 +59,8 @@ try {
     $first.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $firstId = $first.Current.Name.Split(',')[0]
     $script:root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern).Resize(1180, 780)
-    $table.SetFocus()
+    Wait-For { try { (Find-Name 'Inspect selected').SetFocus(); $true } catch { $false } } 'keyboard command focus after native layout' | Out-Null
+    Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait('{END}')
     Wait-For {
         $selected = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).GetCurrentSelection()

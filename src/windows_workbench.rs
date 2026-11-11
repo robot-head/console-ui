@@ -47,7 +47,7 @@ pub enum Message {
     EditBookmark(u64),
     Jump(u64, Selection),
     Timeline { tab: u64, session: u64, cursor: u64 },
-    NativeSelection(Option<Selection>),
+    NativeSelection(u64, Option<Selection>),
     Column { key: String, change: ColumnChange },
 }
 #[derive(Clone)]
@@ -63,6 +63,7 @@ pub struct Workbench {
     flags: BTreeMap<&'static str, bool>,
     timer: ComponentTimer,
     navigation: u64,
+    last_tab: u64,
     dialog: bool,
     lookup: ElementRef<TextBox>,
     focus_timer: Option<ComponentTimer>,
@@ -85,6 +86,7 @@ impl Component for Workbench {
             flags: BTreeMap::new(),
             timer: context.set_local_timeout(Duration::from_millis(250), || Message::Tick),
             navigation: 0,
+            last_tab: 0,
             dialog: false,
             lookup: ElementRef::new(),
             focus_timer: None,
@@ -158,7 +160,20 @@ impl Component for Workbench {
                 Message::Flag(key, value) => {
                     self.flags.insert(key, value);
                 }
-                Message::Action(action) => self.app.dispatch(action)?,
+                Message::Action(action) => {
+                    if matches!(
+                        &action,
+                        Action::ApplyPreset { .. } | Action::LoadView { .. }
+                    ) {
+                        self.fields.remove("query");
+                        self.fields.remove("graph_query");
+                        self.fields.remove("window");
+                    }
+                    if matches!(&action, Action::Window { .. }) {
+                        self.fields.remove("window");
+                    }
+                    self.app.dispatch(action)?;
+                }
                 Message::Apply(form) => self.apply(form)?,
                 Message::Pick(action) => {
                     let action = if matches!(&action, Action::Compare { .. }) {
@@ -202,7 +217,10 @@ impl Component for Workbench {
                     self.navigation += 1;
                     self.panel = Panel::Monitor;
                 }
-                Message::NativeSelection(selection) => {
+                Message::NativeSelection(tab, selection) => {
+                    if self.app.active != tab {
+                        return Ok(());
+                    }
                     if let Some(selection) = selection {
                         if selection.session == self.app.current().worker.read().session {
                             self.app.dispatch(Action::Select {
@@ -251,6 +269,29 @@ impl Component for Workbench {
             }
             Ok(())
         })();
+        if self.last_tab != self.app.active {
+            self.fields.retain(|key, _| {
+                ![
+                    "query",
+                    "graph_query",
+                    "endpoint",
+                    "lookup",
+                    "histogram_mode",
+                    "histogram_tasks",
+                    "histogram_query",
+                    "histogram_limit",
+                    "histogram_rotation",
+                    "seek_offset",
+                    "speed",
+                    "window",
+                    "bookmark_id",
+                    "bookmark_name",
+                    "bookmark_note",
+                ]
+                .contains(key)
+            });
+            self.last_tab = self.app.active;
+        }
         if let Err(error) = result {
             self.app.notice = Some(format!("{error:#}"));
         }
@@ -276,7 +317,10 @@ impl Component for Workbench {
                     query: tab.document.filter.clone(),
                     tables: tab.document.tables.clone(),
                     navigation: tab.selection.clone().map(|s| (self.navigation, s)),
-                    on_selection: context.callback(Message::NativeSelection),
+                    on_selection: {
+                        let id = tab.document.id;
+                        context.callback(move |selection| Message::NativeSelection(id, selection))
+                    },
                     on_target: context
                         .callback(|target| Message::Action(Action::Connect { target })),
                     on_query: context
@@ -462,6 +506,9 @@ impl Workbench {
             },
             "connect" => Action::Connect {
                 target: self.value("endpoint", &self.app.current().document.target),
+            },
+            "graph_filter" => Action::GraphFilter {
+                expression: self.value("graph_query", &self.app.current().document.graph_filter),
             },
             "filter" => Action::Filter {
                 expression: self.value("query", &self.app.current().document.filter),
@@ -917,10 +964,30 @@ impl Workbench {
             self.entry(
                 "window",
                 "Analysis window (e.g. 60s, 5min, or none)",
-                "60s",
+                &self
+                    .app
+                    .current()
+                    .window_ns
+                    .map_or_else(|| "none".into(), |ns| format!("{ns}ns")),
                 c,
             ),
             button("Apply time window", c, Message::Apply("window")),
+            row([
+                ("10s", 10_000_000_000),
+                ("60s", 60_000_000_000),
+                ("5min", 300_000_000_000),
+            ]
+            .into_iter()
+            .map(|(label, ns)| {
+                button(
+                    label,
+                    c,
+                    Message::Action(Action::Window {
+                        nanoseconds: Some(ns),
+                    }),
+                )
+            })
+            .collect()),
         ];
         if let Some(window) = view.window {
             controls.push(
@@ -964,7 +1031,14 @@ impl Workbench {
             .into(),
         );
         for metric in ["busy", "scheduled", "polls"] {
-            if let Ok(svg) = crate::sharing::chart_svg(&view.trends, metric) {
+            if let Ok(svg) = crate::sharing::chart_svg_scoped(
+                &view.trends,
+                metric,
+                view.selection
+                    .as_ref()
+                    .filter(|s| s.kind == "task")
+                    .map(|s| s.id),
+            ) {
                 let chart = Image::new()
                     .source_svg(EncodedImage::new(svg.into_bytes()))
                     .height(240.0)
@@ -1038,6 +1112,35 @@ impl Workbench {
             text("Readiness comes from async operations. It does not establish lock ownership.")
                 .into(),
         );
+        controls.push(self.entry(
+            "graph_query",
+            "Filter graph neighbors (e.g. type:Mutex)",
+            &self.app.current().document.graph_filter,
+            c,
+        ));
+        controls.push(button(
+            "Apply neighbor filter",
+            c,
+            Message::Apply("graph_filter"),
+        ));
+        for node in view.graph.nodes.iter().take(50) {
+            if let Some((kind, id)) = node.key.split_once(':')
+                && let Ok(id) = id.parse()
+            {
+                controls.push(button(
+                    &format!("{} · {}", node.key, node.label),
+                    c,
+                    Message::Jump(
+                        self.app.active,
+                        Selection {
+                            kind: kind.into(),
+                            id,
+                            session: view.session,
+                        },
+                    ),
+                ));
+            }
+        }
         for edge in view.graph.edges {
             let mut cells =
                 vec![text(&format!("{} → {} · {}", edge.from, edge.to, edge.label)).into()];
@@ -1198,7 +1301,7 @@ impl Workbench {
         stack(controls)
     }
     fn comparison(&self, c: &ViewContext<Self>) -> View {
-        let mut controls=vec![heading("Compare diagnostic captures"),text("Open the current recording first, then choose a baseline. Metrics are normalized to each session's observation interval.").into(),self.entry("baseline_session","Baseline session index","0",c),self.entry("regression_percent","Relative regression threshold (%)","10",c),self.entry("regression_ms","Absolute busy/scheduling/latency threshold (ms)","1",c),self.entry("regression_polls","Polling-rate increase threshold (polls/s)","100",c)];
+        let mut controls=vec![heading("Compare diagnostic captures"),text("Open the current recording first, then choose a baseline. Metrics are normalized to each session's observation interval.").into(),self.entry("baseline_session","Baseline session index","0",c),self.entry("regression_percent","Relative regression threshold (%)","10",c),self.entry("regression_ms","Absolute increase: timing (ms/s), latency (ms)","1",c),self.entry("regression_polls","Polling-rate increase threshold (polls/s)","100",c)];
         controls.push(self.check("added_regression", "Treat added entities as regressions", c));
         controls.push(self.check(
             "removed_regression",
@@ -1214,7 +1317,14 @@ impl Workbench {
                 policy: Default::default(),
             }),
         ));
-        if let Some(comparison) = &self.app.comparison {
+        if let Some(comparison) = &self.app.current().comparison {
+            controls.push(
+                text(&format!(
+                    "Observed sample intervals: baseline {:.3}s; current {:.3}s",
+                    comparison.observation_seconds[0], comparison.observation_seconds[1]
+                ))
+                .into(),
+            );
             for note in &comparison.notes {
                 controls.push(text(note).into());
             }

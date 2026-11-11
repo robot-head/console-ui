@@ -99,7 +99,7 @@ struct RuntimeView: Decodable { let histogramPolicy:HistogramPolicy;let histogra
         if save { let panel = NSSavePanel(); panel.allowedContentTypes=extensions.compactMap { UTType(filenameExtension:$0) }; panel.canCreateDirectories = true; panel.nameFieldStringValue = "capture.\(extensions[0])"; panel.begin { response in if response == .OK, let url = panel.url { guarded(url.path) } } }
         else { let panel = NSOpenPanel(); panel.allowedContentTypes=extensions.compactMap { UTType(filenameExtension:$0) }; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false; panel.begin { response in if response == .OK, let url = panel.url { guarded(url.path) } } }
     }
-    func select(_ kind: String, _ id: UInt64) { send("select_in_session", ["kind": kind, "id": id, "session":state?.session ?? 0]) }
+    func select(_ kind: String, _ id: UInt64, session:UInt64? = nil) { send("select_in_session", ["kind": kind, "id": id, "session":session ?? state?.session ?? 0]) }
 }
 
 enum Section: String, CaseIterable, Identifiable, Hashable { case tasks = "Tasks", resources = "Resources", operations = "Async operations", analysis = "Analysis", recording = "Recording", compare = "Compare", sharing = "Export & share", connections = "Connections", workspace = "Workspace"; var id: String { rawValue } }
@@ -165,7 +165,7 @@ struct ContentView: View {
 struct TaskTable: View {
     @ObservedObject var model: RuntimeModel
     @State private var order = [KeyPathComparator(\TaskRow.name)]
-    private var selected: Binding<UInt64?> { Binding(get: { model.state?.selection?.kind == "task" ? model.state?.selection?.id : nil }, set: { if let id = $0 { model.select("task", id) } }) }
+    private var selected: Binding<UInt64?> { let session=model.state?.session; return Binding(get: { model.state?.selection?.kind == "task" ? model.state?.selection?.id : nil }, set: { if let id = $0 { model.select("task", id,session:session) } }) }
     var body: some View { Table((model.state?.snapshot.tasks ?? []).sorted(using: order), selection: selected, sortOrder: $order) {
         TableColumn("ID", value: \.id) { Text(String($0.id)) }.width(min: 50, ideal: 70)
         TableColumn("Name", value: \.name).width(min: 130, ideal: 220)
@@ -179,7 +179,7 @@ struct TaskTable: View {
 struct ResourceTable: View {
     @ObservedObject var model: RuntimeModel
     @State private var order = [KeyPathComparator(\ResourceRow.total, order: .reverse)]
-    private var selected: Binding<UInt64?> { Binding(get: { model.state?.selection?.kind == "resource" ? model.state?.selection?.id : nil }, set: { if let id = $0 { model.select("resource", id) } }) }
+    private var selected: Binding<UInt64?> { let session=model.state?.session; return Binding(get: { model.state?.selection?.kind == "resource" ? model.state?.selection?.id : nil }, set: { if let id = $0 { model.select("resource", id,session:session) } }) }
     var body: some View { Table((model.state?.snapshot.resources ?? []).sorted(using: order), selection: selected, sortOrder: $order) {
         TableColumn("ID", value: \.id) { Text(String($0.id)) }
         TableColumn("Type", value: \.concreteType)
@@ -191,7 +191,8 @@ struct ResourceTable: View {
 }
 struct OperationTable: View {
     @ObservedObject var model: RuntimeModel
-    var body: some View { Table(model.state?.snapshot.asyncOps ?? [], selection: Binding(get: { model.state?.selection?.kind == "operation" ? model.state?.selection?.id : nil }, set: { if let id = $0 { model.select("operation", id) } })) {
+    private var selected:Binding<UInt64?> {let session=model.state?.session;return Binding(get: { model.state?.selection?.kind == "operation" ? model.state?.selection?.id : nil }, set: { if let id = $0 { model.select("operation", id,session:session) } })}
+    var body: some View { Table(model.state?.snapshot.asyncOps ?? [], selection:selected) {
         TableColumn("ID") { Text(String($0.id)) }; TableColumn("Task") { Text("\($0.taskId ?? 0) \($0.taskName)") }; TableColumn("Source", value: \.source); TableColumn("Busy") { Text(ns($0.timing.busy)) }; TableColumn("Polls") { Text(String($0.timing.polls)) }; TableColumn("Attributes", value: \.attributes)
     } }
 }
@@ -209,8 +210,8 @@ struct Inspector: View {
                 Text(t.location).textSelection(.enabled); Text(t.fields).font(.system(.caption, design: .monospaced)).textSelection(.enabled); Button("Open source in editor") { model.send("open_source") }
             } else if selected.kind == "resource", let r = state.inspection.resources.first(where: { $0.id == selected.id }) {
                 Text("\(r.concreteType) / resource \(r.id)").font(.title2); Text("\(r.kind) · \(r.internal ? "INT" : "PUB") · \(ns(r.total))"); Text(r.location).textSelection(.enabled); Text(r.attributes).textSelection(.enabled)
-                ForEach(state.inspection.asyncOps.filter { $0.resourceId == r.id }) { op in GroupBox(op.source) { VStack(alignment: .leading) { Text("Task \(op.taskId ?? 0) \(op.taskName)"); Text("\(op.timing.polls) polls · \(ns(op.timing.busy)) busy · \(ns(op.timing.idle)) idle"); Text(op.attributes); if let id = op.taskId { Button("Inspect waiting task") { model.select("task", id) } } } } }
-            } else if let op = state.inspection.asyncOps.first(where: { $0.id == selected.id }) { Text(op.source).font(.title2); Text(op.attributes); if let id = op.taskId { Button("Inspect operation's task") { model.select("task", id) } } }
+                ForEach(state.inspection.asyncOps.filter { $0.resourceId == r.id }) { op in GroupBox(op.source) { VStack(alignment: .leading) { Text("Task \(op.taskId ?? 0) \(op.taskName)"); Text("\(op.timing.polls) polls · \(ns(op.timing.busy)) busy · \(ns(op.timing.idle)) idle"); Text(op.attributes); if let id = op.taskId { Button("Inspect waiting task") { model.select("task", id,session:state.session) } } } } }
+            } else if let op = state.inspection.asyncOps.first(where: { $0.id == selected.id }) { Text(op.source).font(.title2); Text(op.attributes); if let id = op.taskId { Button("Inspect operation's task") { model.select("task", id,session:state.session) } } }
         } else { Text("Select a task or resource to inspect timing, wakers, source fields, and latency distributions.").foregroundStyle(.secondary) }
     }.padding(16).frame(maxWidth: .infinity, alignment: .leading) } }
 }
@@ -394,7 +395,7 @@ struct LookupPanel: View {
     @ObservedObject var model: RuntimeModel
     @State private var query = ""
     @FocusState private var focused: Bool
-    var body: some View { VStack(alignment: .leading) { Text("Find a task").font(.title2); TextField("Task name or ID", text: $query).focused($focused); List(model.state?.lookupTasks ?? []) { task in Button("\(task.id) · \(task.name) · \(task.location)") { model.select("task",task.id); model.lookup = false } }; Button("Close") { model.lookup = false }.keyboardShortcut(.cancelAction) }.padding().frame(width: 700,height: 480).onAppear { focused = true;model.send("lookup",["text":query]) }.onChange(of:query){_,value in model.send("lookup",["text":value])} }
+    var body: some View { let session=model.state?.session; return VStack(alignment: .leading) { Text("Find a task").font(.title2); TextField("Task name or ID", text: $query).focused($focused); List(model.state?.lookupTasks ?? []) { task in Button("\(task.id) · \(task.name) · \(task.location)") { model.select("task",task.id,session:session); model.lookup = false } }; Button("Close") { model.lookup = false }.keyboardShortcut(.cancelAction) }.padding().frame(width: 700,height: 480).onAppear { focused = true;model.send("lookup",["text":query]) }.onChange(of:query){_,value in model.send("lookup",["text":value])} }
 }
 struct ChartPoint: Identifiable {let now:UInt64;let value:Double;let segment:Int;var id:UInt64 {now}}
 struct TrendChart: View {

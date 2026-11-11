@@ -26,7 +26,7 @@ Precedence is application defaults → project settings/presets → explicit ses
 settings or CLI flags. Imported project policy does not replace global defaults.
 Explicit complete Settings documents are complete session overrides. A workspace
 contains `schema_version`, `name`, `active`, `tabs`, `policy`, and `views`. A recorded
-tab stores its investigation view so cursor/session/filter/columns/selection restore
+tab stores its investigation view so cursor/session/filter/graph-filter/columns/selection restore
 without opening a live connection. Restore jobs keep missing files isolated to their
 tab. A live view intentionally clears saved numeric selection to avoid ID reuse.
 A moved capture can be reopened from its new path; colocated sidecar references are
@@ -35,7 +35,10 @@ remapped to it. New Workspace provides recovery without deleting the invalid fil
 A capture's `<name>.tcui.investigation.json` sidecar stores versioned bookmarks,
 notes, named investigation views, and reusable filter presets. It does not modify
 the capture. Bookmarks bind session and producer timestamp plus optional task/resource
-ID. Views can be updated, renamed, duplicated, restored, and deleted independently.
+ID. While a background seek is pending, cursor labels, bookmarks, saved views, and
+exports continue to describe the installed snapshot. Bookmark selections are restored
+after the destination session loads. Views can be updated, renamed, duplicated,
+restored, and deleted independently.
 
 ## Filters
 
@@ -72,13 +75,17 @@ corruption. Missing histogram streams are unknown, never zero latency.
 Export JSON contains schema version, session, endpoint, optional selected chart
 range, a numeric Snapshot, notes, and selected report sections. All timing values
 and timestamps are integer nanoseconds; polls/wakes/bucket counts are integers.
-HDR details include availability/error, in-range count and percentile values, bins,
+Task `stats_available` is false until creation/timing counters are present; missing
+counters cannot pass automated budgets. HDR details include availability/error, in-range count and percentile values, bins,
 and separate high-outlier count/maximum. CSV uses UTF-8 with CRLF records, RFC-style
 quoted fields, unit-bearing headers, source identifiers, selected range, dropped
 counts, and lifetime/availability indicators. CSV does not flatten HDR distributions;
 use JSON for those. Table counters are lifetime values at the cursor even when a
 chart/window range is selected. Window rankings and baseline comparisons use counter
-deltas, and interval histograms subtract HDR bucket counts exactly.
+deltas, and interval histograms subtract HDR bucket counts exactly. Comparison normalization
+uses the actual counter sample interval (reported as `observation_seconds`), even
+when a cursor lies between producer updates. Export `chart_task` distinguishes an
+individual task chart from a retained-task aggregate.
 
 Busy/scheduled charts sum interval deltas over retained tasks, or show the selected
 task. Poll charts divide poll deltas by producer-time seconds. Bounded history may

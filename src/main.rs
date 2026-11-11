@@ -119,6 +119,7 @@ fn run(cli: Cli) -> Result<()> {
             query,
             session,
             at_ns,
+            chart_task,
             redact_fields,
             redact_paths,
             redact_endpoint,
@@ -130,11 +131,21 @@ fn run(cli: Cli) -> Result<()> {
                 .get(*session)
                 .ok_or_else(|| anyhow::anyhow!("Session is unavailable"))?
                 .clone();
-            let snapshot = recording.seek(*session, at_ns.unwrap_or(info.end), &settings)?;
+            let cursor = at_ns.unwrap_or(info.end);
+            let snapshot = recording.seek(*session, cursor, &settings)?;
+            anyhow::ensure!(
+                chart_task.is_none_or(|id| snapshot.tasks.iter().any(|t| t.id == id)),
+                "Chart task is unavailable at this cursor"
+            );
+            let points = recording
+                .history(*session, cursor, &settings)?
+                .points_for(*chart_task);
             let snapshot = console_ui::query::Query::parse(query)?.filter(&snapshot);
             let mut document =
                 console_ui::sharing::ExportDocument::new(*session as u64, info.target, snapshot);
-            document.range = Some([info.start, info.end]);
+            document.range = Some([info.start, cursor]);
+            document.chart_task = *chart_task;
+            document.notes.push("Tables show lifetime counters at the cursor; charts use bounded interval history and label their task or aggregate scope.".into());
             let policy = console_ui::sharing::RedactionPolicy {
                 fields: redact_fields.iter().cloned().collect(),
                 source_paths: *redact_paths,
@@ -144,8 +155,12 @@ fn run(cli: Cli) -> Result<()> {
             match format.as_str() {
                 "json" => document.json(output)?,
                 "csv" => document.csv(output, table)?,
-                "html" => document.report(output, &[], None)?,
-                _ => anyhow::bail!("Choose json, csv, or html export format"),
+                "html" => document.report(output, &points, None)?,
+                "svg" => console_ui::preferences::atomic_write(
+                    output,
+                    console_ui::sharing::chart_svg_scoped(&points, table, *chart_task)?.as_bytes(),
+                )?,
+                _ => anyhow::bail!("Choose json, csv, html, or svg export format"),
             };
             Ok(())
         }

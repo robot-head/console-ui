@@ -16,6 +16,7 @@ pub struct Counters {
     pub busy: u64,
     pub scheduled: u64,
     pub polls: u64,
+    pub available: bool,
 }
 impl From<&Timing> for Counters {
     fn from(t: &Timing) -> Self {
@@ -24,6 +25,7 @@ impl From<&Timing> for Counters {
             busy: t.busy,
             scheduled: t.scheduled,
             polls: t.polls,
+            available: true,
         }
     }
 }
@@ -96,7 +98,15 @@ impl History {
             tasks: snapshot
                 .tasks
                 .iter()
-                .map(|t| (t.id, Counters::from(&t.timing)))
+                .map(|t| {
+                    (
+                        t.id,
+                        Counters {
+                            available: t.stats_available,
+                            ..Counters::from(&t.timing)
+                        },
+                    )
+                })
                 .collect(),
         };
         let size = sample.tasks.len() * 80 + 64;
@@ -138,6 +148,7 @@ impl History {
                     ..Default::default()
                 };
                 let mut polls = 0u64;
+                point.gap |= task.is_some_and(|id| !b.tasks.contains_key(&id));
                 for (id, end) in &b.tasks {
                     if task.is_some_and(|task| task != *id) {
                         continue;
@@ -155,14 +166,20 @@ impl History {
                             .scheduled_ns
                             .saturating_add(end.scheduled.saturating_sub(start.scheduled));
                         polls = polls.saturating_add(end.polls.saturating_sub(start.polls));
-                        point.gap |= end.busy < start.busy
+                        point.gap |= !end.available
+                            || (!start.available && a.tasks.contains_key(id))
+                            || end.busy < start.busy
                             || end.polls < start.polls
                             || end.scheduled < start.scheduled;
                     } else {
                         point.gap = true;
                     }
                 }
-                point.gap |= a.tasks.keys().any(|id| !b.tasks.contains_key(id));
+                point.gap |= a
+                    .tasks
+                    .keys()
+                    .filter(|id| task.is_none_or(|task| task == **id))
+                    .any(|id| !b.tasks.contains_key(id));
                 let seconds = b.now.saturating_sub(a.now) as f64 / 1e9;
                 point.polls_per_second = if seconds > 0.0 {
                     polls as f64 / seconds
@@ -203,11 +220,13 @@ impl History {
                 polls: counters
                     .map(|s| task.timing.polls.saturating_sub(s.polls))
                     .unwrap_or(if new { task.timing.polls } else { 0 }),
-                available: counters.map_or(new, |s| {
-                    task.timing.busy >= s.busy
-                        && task.timing.scheduled >= s.scheduled
-                        && task.timing.polls >= s.polls
-                }),
+                available: task.stats_available
+                    && counters.map_or(new, |s| {
+                        s.available
+                            && task.timing.busy >= s.busy
+                            && task.timing.scheduled >= s.scheduled
+                            && task.timing.polls >= s.polls
+                    }),
             });
         }
         let missing = anchor
@@ -262,7 +281,9 @@ pub fn interval(baseline: &Snapshot, current: &Snapshot) -> (Snapshot, bool) {
         .iter()
         .any(|old| !current.tasks.iter().any(|t| t.id == old.id));
     for task in &mut result.tasks {
+        incomplete |= !task.stats_available;
         if let Some(old) = baseline.tasks.iter().find(|t| t.id == task.id) {
+            incomplete |= !old.stats_available;
             incomplete |= task.timing.polls < old.timing.polls
                 || task.timing.busy < old.timing.busy
                 || task.timing.scheduled < old.timing.scheduled;
@@ -357,6 +378,14 @@ pub struct ContentionGraph {
     pub truncated: bool,
 }
 pub fn contention_graph(snapshot: &Snapshot, focus: Option<&str>, limit: usize) -> ContentionGraph {
+    contention_graph_filtered(snapshot, focus, limit, &crate::query::Query::default())
+}
+pub fn contention_graph_filtered(
+    snapshot: &Snapshot,
+    focus: Option<&str>,
+    limit: usize,
+    query: &crate::query::Query,
+) -> ContentionGraph {
     let mut graph = ContentionGraph::default();
     for task in &snapshot.tasks {
         graph.nodes.push(GraphNode {
@@ -409,6 +438,26 @@ pub fn contention_graph(snapshot: &Snapshot, focus: Option<&str>, limit: usize) 
             .collect();
         graph.nodes.retain(|n| keys.contains(&n.key));
     }
+    let mut allowed: BTreeSet<_> = snapshot
+        .tasks
+        .iter()
+        .filter(|t| query.task(t))
+        .map(|t| format!("task:{}", t.id))
+        .chain(
+            snapshot
+                .resources
+                .iter()
+                .filter(|r| query.resource(r))
+                .map(|r| format!("resource:{}", r.id)),
+        )
+        .collect();
+    if let Some(focus) = focus {
+        allowed.insert(focus.to_owned());
+    }
+    graph.nodes.retain(|n| allowed.contains(&n.key));
+    graph
+        .edges
+        .retain(|e| allowed.contains(&e.from) && allowed.contains(&e.to));
     // Keep connected pairs together. A large task list must not crowd every resource
     // out of the bounded graph and hide all contention evidence.
     let original_len = graph.nodes.len();
@@ -483,6 +532,7 @@ pub struct Comparison {
     pub schema_version: u32,
     pub rows: Vec<ComparisonRow>,
     pub notes: Vec<String>,
+    pub observation_seconds: [f64; 2],
 }
 pub fn compare(
     a: &Snapshot,
@@ -689,5 +739,5 @@ pub fn compare(
             .then(a.name.cmp(&b.name))
             .then(a.key.cmp(&b.key))
     });
-    Ok(Comparison { schema_version:1,rows,notes:vec!["Entities match by source, target, kind and name; resource operations also include their task/resource identity. Duplicate identities are ambiguous, never asserted as regressions.".into(),"Rates use observation-window deltas. Resource busy/poll rates aggregate its operations. Missing or outlier-limited histograms are unknown. Added/removed entities follow the configured policy.".into()] })
+    Ok(Comparison { schema_version:1,rows,observation_seconds:seconds,notes:vec!["Entities match by source, target, kind and name; resource operations also include their task/resource identity. Duplicate identities are ambiguous, never asserted as regressions.".into(),"Rates use observation-window deltas. Resource busy/poll rates aggregate its operations. Missing or outlier-limited histograms are unknown. Added/removed entities follow the configured policy.".into()] })
 }

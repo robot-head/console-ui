@@ -398,6 +398,16 @@ impl Recording {
         end: u64,
         settings: &Settings,
     ) -> Result<Snapshot> {
+        self.window_with_duration(session, start, end, settings)
+            .map(|(snapshot, _)| snapshot)
+    }
+    pub fn window_with_duration(
+        &mut self,
+        session: usize,
+        start: u64,
+        end: u64,
+        settings: &Settings,
+    ) -> Result<(Snapshot, f64)> {
         ensure!(
             end > start,
             "An analysis window must have positive duration"
@@ -414,12 +424,13 @@ impl Recording {
         let settings = &complete_settings;
         let baseline = self.seek(session, start, settings)?;
         let current = self.seek(session, end, settings)?;
+        let seconds = current.now.saturating_sub(baseline.now) as f64 / 1e9;
         let (interval, incomplete) = crate::analysis::interval(&baseline, &current);
         ensure!(
             !incomplete,
             "Recording interval contains missing telemetry or counter resets"
         );
-        Ok(interval)
+        Ok((interval, seconds))
     }
 }
 
@@ -441,6 +452,8 @@ pub struct InvestigationView {
     pub cursor: u64,
     pub range: Option<[u64; 2]>,
     pub filter: String,
+    #[serde(default)]
+    pub graph_filter: String,
     pub tables: std::collections::BTreeMap<String, TablePreferences>,
     pub selected: Option<(String, u64)>,
 }
@@ -448,6 +461,7 @@ impl InvestigationView {
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.name.trim().is_empty(), "View needs a name");
         crate::query::Query::parse(&self.filter)?;
+        crate::query::Query::parse(&self.graph_filter)?;
         for preferences in self.tables.values() {
             preferences.validate()?;
         }
