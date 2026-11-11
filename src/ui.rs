@@ -99,7 +99,7 @@ pub struct Console {
     navigation: u64,
     notified_selection: Option<crate::workspace::Selection>,
     tables: BTreeMap<String, crate::preferences::TablePreferences>,
-    selected_row: ElementRef<Border>,
+    selected_row: ElementRef<Button>,
     focus_timer: Option<ComponentTimer>,
 }
 
@@ -174,7 +174,14 @@ impl Component for Console {
         );
         match message {
             Message::FocusSelection => {
-                let _ = self.selected_row.request_focus();
+                let queued = self.selected_row.request_focus_result(|result| {
+                    if !matches!(result, Ok(true)) {
+                        eprintln!("Selected row focus: {result:?}");
+                    }
+                });
+                if !queued {
+                    eprintln!("Selected row is not realized for keyboard focus");
+                }
             }
             Message::Tick => {
                 let next = self.worker.read();
@@ -893,9 +900,13 @@ impl Console {
                                 })
                                 .collect::<Vec<View>>(),
                         );
-                    let frame = Border::new()
-                        .is_tab_stop(self.selected == Some(row.id))
-                        .content(content);
+                    // Use a native focusable control so WinUI can bring the
+                    // keyboard selection into view, including offscreen rows.
+                    let frame = Button::new()
+                        .style(ButtonStyle::Subtle)
+                        .width(width)
+                        .content(content)
+                        .on_click(context.message(Message::Select(Some(row.id))));
                     DataItem::new(row.id, description).content(if self.selected == Some(row.id) {
                         frame.element_ref(&self.selected_row)
                     } else {

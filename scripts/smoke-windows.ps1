@@ -2,6 +2,14 @@
 param([string]$Executable = "$PSScriptRoot/../dist/console-ui-win-x64/console-ui.exe")
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing, System.Windows.Forms
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class NativeSmokeWindow {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+'@
 $demo = $null
 $app = $null
 function Wait-For([scriptblock]$Check, [string]$Description) {
@@ -59,6 +67,10 @@ try {
     $first.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $firstId = $first.Current.Name.Split(',')[0]
     $script:root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern).Resize(1180, 780)
+    Wait-For {
+        [NativeSmokeWindow]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
+        [NativeSmokeWindow]::GetForegroundWindow() -eq $app.MainWindowHandle
+    } 'foreground native window for keyboard input' | Out-Null
     Wait-For { try { (Find-Name 'Inspect selected').SetFocus(); $true } catch { $false } } 'keyboard command focus after native layout' | Out-Null
     Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait('{END}')
@@ -111,6 +123,17 @@ try {
     $snapshot = Get-Content $replay -Raw | ConvertFrom-Json
     if ($snapshot.tasks.Count -lt 1) { throw 'Shutdown recording lost its task data' }
     Write-Output 'Packaged app inspected tasks/resources, filtered a task, rendered analysis, paused/resumed, and flushed a replayable capture on native window close.'
+} catch {
+    try {
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        Write-Output "Keyboard focus: $($focused.Current.Name); process $($focused.Current.ProcessId)"
+        if ($table) {
+            $chosen = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            foreach ($row in $chosen) { Write-Output "Selected row: $($row.Current.Name); offscreen $($row.Current.IsOffscreen)" }
+        }
+        Capture 'failure'
+    } catch { Write-Output "Unable to capture smoke failure: $_" }
+    throw
 } finally {
     if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id -Force }
     if ($demo -and -not $demo.HasExited) { Stop-Process -Id $demo.Id -Force }
