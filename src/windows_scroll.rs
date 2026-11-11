@@ -13,8 +13,9 @@ use windows::{
         },
         UI::Accessibility::{
             CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationScrollItemPattern,
-            IUIAutomationSelectionItemPattern, TreeScope_Descendants, UIA_AutomationIdPropertyId,
-            UIA_ScrollItemPatternId, UIA_SelectionItemPatternId,
+            IUIAutomationScrollPattern, IUIAutomationSelectionItemPattern, TreeScope_Descendants,
+            UIA_AutomationIdPropertyId, UIA_ScrollItemPatternId, UIA_ScrollPatternId,
+            UIA_SelectionItemPatternId,
         },
     },
     core::{Interface, Result},
@@ -23,11 +24,12 @@ use windows::{
 struct Request {
     window: usize,
     row: String,
+    position: f64,
 }
 type Queue = Arc<(Mutex<Option<Request>>, Condvar)>;
 static QUEUE: OnceLock<Option<Queue>> = OnceLock::new();
 
-pub(crate) fn request(window: usize, row: String) {
+pub(crate) fn request(window: usize, row: String, position: f64) {
     if std::env::var_os("CONSOLE_UI_TRACE_SCROLL").is_some() {
         eprintln!("Native scroll queued for window {window:x}: {row}");
     }
@@ -50,7 +52,11 @@ pub(crate) fn request(window: usize, row: String) {
     });
     if let Some(queue) = queue {
         // Coalesce key repeat to the most recent selection instead of queuing RPCs.
-        *queue.0.lock().unwrap() = Some(Request { window, row });
+        *queue.0.lock().unwrap() = Some(Request {
+            window,
+            row,
+            position,
+        });
         queue.1.notify_one();
     }
 }
@@ -119,6 +125,31 @@ fn scroll(automation: &IUIAutomation, request: &Request) -> Result<()> {
             let scroll: IUIAutomationScrollItemPattern =
                 row.GetCurrentPatternAs(UIA_ScrollItemPatternId)?;
             scroll.ScrollIntoView()?;
+            // WinUI may acknowledge ScrollItem without scrolling an explicit
+            // item container. Use its owning list's position as a fallback.
+            let table_id = request.row.rsplit_once('-').unwrap().0;
+            let condition = automation
+                .CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from(table_id))?;
+            let table = window.FindFirst(TreeScope_Descendants, &condition)?;
+            let container: IUIAutomationScrollPattern =
+                table.GetCurrentPatternAs(UIA_ScrollPatternId)?;
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                if !selected.CurrentIsSelected()?.as_bool() || !row.CurrentIsOffscreen()?.as_bool()
+                {
+                    break;
+                }
+                if container.CurrentVerticallyScrollable()?.as_bool() {
+                    if std::env::var_os("CONSOLE_UI_TRACE_SCROLL").is_some() {
+                        eprintln!(
+                            "Native list scroll: {} to {}",
+                            container.CurrentVerticalScrollPercent()?,
+                            request.position
+                        );
+                    }
+                    container.SetScrollPercent(-1.0, request.position)?;
+                }
+            }
             if std::env::var_os("CONSOLE_UI_TRACE_SCROLL").is_some() {
                 eprintln!("Native scroll completed: {}", request.row);
             }

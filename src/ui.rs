@@ -189,8 +189,12 @@ impl Component for Console {
             Message::FocusSelection => {
                 if let Some(id) = self.selected {
                     let row = self.row_automation_id(id);
+                    let rows = self.rows();
+                    let index = rows.iter().position(|row| row.id == id).unwrap_or(0);
+                    let position =
+                        100.0 * index as f64 / rows.len().saturating_sub(1).max(1) as f64;
                     let queued = context.run_window(move |window| {
-                        crate::windows_scroll::request(window.as_raw() as usize, row);
+                        crate::windows_scroll::request(window.as_raw() as usize, row, position);
                         Message::SelectionScrolled
                     });
                     if !queued {
@@ -419,13 +423,16 @@ impl Component for Console {
 }
 
 impl Console {
-    fn row_automation_id(&self, id: u64) -> String {
+    fn table_automation_id(&self) -> String {
         format!(
-            "console-{}-{}-{}-{id}",
+            "console-{}-{}-{}",
             self.instance,
             self.live.session,
             self.table_key()
         )
+    }
+    fn row_automation_id(&self, id: u64) -> String {
+        format!("{}-{id}", self.table_automation_id())
     }
     fn table_key(&self) -> &'static str {
         match self.screen {
@@ -893,6 +900,7 @@ impl Console {
             )
         } else {
             ListBox::new()
+                .automation_id(self.table_automation_id())
                 .automation_name("Live telemetry table")
                 .on_selected_tag_changed(context.callback(|tag: Option<Rc<str>>| {
                     Message::Select(tag.and_then(|tag| tag.parse().ok()))
