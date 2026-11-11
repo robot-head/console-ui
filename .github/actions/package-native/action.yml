@@ -57,6 +57,10 @@ runs:
       with:
         key: release-${{ inputs.platform }}
     - shell: bash
+      if: runner.os != 'Windows'
+      run: cargo build --locked --example instrumented -p console-ui
+    - shell: pwsh
+      if: runner.os == 'Windows'
       run: cargo build --locked --example instrumented -p console-ui
     - name: Stage Windows self-contained application
       if: runner.os == 'Windows'
