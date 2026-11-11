@@ -173,7 +173,7 @@ publication. The existing `v0.1.0` tag and published assets stay immutable.
 
 An explicit manual `-f distribution=preview` builds untrusted-development previews
 without signing credentials and produces no GitHub release. PR packaging checks use
-that same path. [Signing checks](../.github/workflows/signing-checks.yml) also test
-release policy and notarization failure cleanup, real Authenticode tamper detection,
-and GitHub keyless signing/verification of a public test fixture. Fixture signatures
+that same path. CI tests release policy, notarization failure cleanup, and real
+Authenticode tamper detection. [Signing checks](../.github/workflows/signing-checks.yml)
+exercise GitHub keyless signing/verification of a public test fixture. Fixture signatures
 use the signing-checks workflow identity and cannot satisfy the release verifier.

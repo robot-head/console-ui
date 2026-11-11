@@ -178,7 +178,7 @@ jobs:
           tag_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
           test "$tag_commit" = "$SOURCE_SHA"
           if gh release view "$RELEASE_TAG" --json isDraft > release-state.json 2>/dev/null; then
-            python3 -c 'import json; assert json.load(open("release-state.json"))["isDraft"], "Refusing to replace assets on a published release"'
+            python3 -c 'import json, sys; sys.exit(0 if json.load(open("release-state.json"))["isDraft"] else "Refusing to replace assets on a published release")'
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft --title "Console UI $RELEASE_TAG" --generate-notes
           fi

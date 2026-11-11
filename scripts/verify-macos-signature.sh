@@ -8,10 +8,15 @@ for binary in "$app" "$app/Contents/MacOS/console-ui" "$app/Contents/Frameworks/
   SIGNATURE_DETAILS="$details" EXPECTED_TEAM="$team" python3 - <<'PY'
 import os
 details = os.environ['SIGNATURE_DETAILS'].splitlines()
-assert 'TeamIdentifier=' + os.environ['EXPECTED_TEAM'] in details, 'Unexpected Apple signing team'
-assert any(line.startswith('Authority=Developer ID Application:') for line in details), 'Developer ID Application signature required'
-assert any(line.startswith('CodeDirectory ') and 'runtime' in line for line in details), 'Hardened runtime required'
-assert any(line.startswith('Timestamp=') for line in details), 'Trusted signing timestamp required'
+checks = [
+    ('TeamIdentifier=' + os.environ['EXPECTED_TEAM'] in details, 'Unexpected Apple signing team'),
+    (any(line.startswith('Authority=Developer ID Application:') for line in details), 'Developer ID Application signature required'),
+    (any(line.startswith('CodeDirectory ') and 'runtime' in line for line in details), 'Hardened runtime required'),
+    (any(line.startswith('Timestamp=') for line in details), 'Trusted signing timestamp required'),
+]
+for valid, message in checks:
+    if not valid:
+        raise SystemExit(message)
 PY
 done
 xcrun stapler validate "$app"

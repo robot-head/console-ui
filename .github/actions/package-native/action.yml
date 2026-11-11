@@ -42,8 +42,10 @@ runs:
         MACOS_NOTARY_KEY_P8_BASE64: ${{ inputs.macos_notary_key }}
       run: |
         import os, subprocess
-        assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == os.environ['EXPECTED_SOURCE'], 'Checkout differs from validated source'
-        assert os.environ['DISTRIBUTION_SIGNED'] in ('true', 'false'), 'Invalid signing mode'
+        if subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() != os.environ['EXPECTED_SOURCE']:
+            raise SystemExit('Checkout differs from validated source')
+        if os.environ['DISTRIBUTION_SIGNED'] not in ('true', 'false'):
+            raise SystemExit('Invalid signing mode')
         if os.environ['DISTRIBUTION_SIGNED'] == 'true':
             subprocess.run(['python3' if os.name != 'nt' else 'python', 'scripts/release_assets.py', 'preflight', '--platform', os.environ['RELEASE_PLATFORM']], check=True)
     - uses: ./.github/actions/setup-linux-desktop

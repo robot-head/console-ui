@@ -38,7 +38,8 @@ identity="$(SIGNING_KEYCHAIN="$keychain" python3 - <<'PY'
 import os, re, subprocess
 text = subprocess.check_output(['security', 'find-identity', '-v', '-p', 'codesigning', os.environ['SIGNING_KEYCHAIN']], text=True)
 matches = re.findall(r'([A-Fa-f0-9]{40}) "Developer ID Application: [^"\n]+ \(' + re.escape(os.environ['MACOS_TEAM_ID']) + r'\)"', text)
-assert len(matches) == 1, 'Import exactly one valid Developer ID Application identity for the configured team'
+if len(matches) != 1:
+    raise SystemExit('Import exactly one valid Developer ID Application identity for the configured team')
 print(matches[0])
 PY
 )"
@@ -51,13 +52,18 @@ ditto -c -k --sequesterRsrc --keepParent "$app" "$work/notarization.zip"
 xcrun notarytool submit "$work/notarization.zip" --key "$work/notary.p8" \
   --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" \
   --wait --timeout 20m --output-format json > "$work/notarization.json"
+python3 - "$work/notarization.json" <<'PY'
+import json, pathlib, sys
+result = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if result.get('status') != 'Accepted':
+    raise SystemExit('Apple notarization was not accepted: ' + str(result.get('status')))
+PY
+xcrun stapler staple "$app"
+bash "$(dirname "$0")/verify-macos-signature.sh" "$app" "$MACOS_TEAM_ID"
 python3 - "$work/notarization.json" "$evidence" <<'PY'
 import json, os, pathlib, sys
 result = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert result['status'] == 'Accepted', 'Apple notarization was not accepted: ' + result['status']
 output = pathlib.Path(sys.argv[2])
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(json.dumps({'native_signing': 'developer-id-notarized', 'team_id': os.environ['MACOS_TEAM_ID'], 'notarization_id': result['id'], 'notarization_status': result['status']}, indent=2) + '\n')
 PY
-xcrun stapler staple "$app"
-bash "$(dirname "$0")/verify-macos-signature.sh" "$app" "$MACOS_TEAM_ID"

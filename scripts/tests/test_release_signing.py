@@ -137,7 +137,7 @@ elif name=='xcrun' and args[:2]==['notarytool','submit']:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.touch()
             env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"], RUNNER_TEMP=str(root),
-                       GITHUB_ACTIONS="", SIGNING_TEST_TRACE=str(root / "trace"), SIGNING_TEST_STATUS=status,
+                       GITHUB_ACTIONS="", PYTHONOPTIMIZE="1", SIGNING_TEST_TRACE=str(root / "trace"), SIGNING_TEST_STATUS=status,
                        MACOS_TEAM_ID="TEAM123456", MACOS_CERTIFICATE_P12_BASE64=base64.b64encode(b"fixture-p12").decode(),
                        MACOS_CERTIFICATE_PASSWORD="fixture-password", MACOS_NOTARY_KEY_P8_BASE64=base64.b64encode(b"fixture-p8").decode(),
                        MACOS_NOTARY_KEY_ID="fixture", MACOS_NOTARY_ISSUER_ID="fixture")
