@@ -38,8 +38,20 @@ function Set-Text([string]$Name, [string]$Value) {
     $condition = [System.Windows.Automation.AndCondition]::new(
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $Name),
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit))
-    $element = Wait-For { $script:root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition) } $Name
-    $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Value)
+    # WinUI delivers TextChanged asynchronously. Let the controlled field survive
+    # two Workbench refreshes before invoking a button that reads its model value.
+    Wait-For {
+        $element = $script:root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        if (-not $element) { return $false }
+        $pattern = $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        if ($pattern.Current.Value -ne $Value) {
+            $pattern.SetValue($Value)
+            return $false
+        }
+        Start-Sleep -Milliseconds 600
+        $element = $script:root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        $element -and $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -eq $Value
+    } "$Name to retain its entered value" | Out-Null
 }
 function Capture([string]$Name) {
     $bounds = $script:root.Current.BoundingRectangle
@@ -117,8 +129,15 @@ try {
     Invoke-Name 'Apply filter'
     Invoke-Name 'Monitor'
     Invoke-Name 'Tasks'
+    Wait-For {
+        $filter = Find-Name 'Filter telemetry'
+        $filter -and $filter.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -eq 'name:worker-0'
+    } 'applied worker filter in the monitor' | Out-Null
     $table = Wait-For { Find-Name 'Live telemetry table' } 'filtered task table'
-    Wait-For { $table.FindAll([System.Windows.Automation.TreeScope]::Descendants, $itemCondition).Count -eq 1 } 'one filtered worker task' | Out-Null
+    Wait-For {
+        $rows = $table.FindAll([System.Windows.Automation.TreeScope]::Descendants, $itemCondition)
+        $rows.Count -eq 1 -and $rows[0].Current.Name.Contains('worker-0')
+    } 'one filtered worker task' | Out-Null
     Capture 'filtered-task'
     Invoke-Name 'Analysis'
     Invoke-Name 'Apply time window'
@@ -139,6 +158,13 @@ try {
     try {
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
         Write-Output "Keyboard focus: $($focused.Current.Name); process $($focused.Current.ProcessId); automation ID $($focused.Current.AutomationId)"
+        foreach ($name in @('Filter expression', 'Filter telemetry')) {
+            $filter = Find-Name $name
+            if ($filter -and $filter.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit) {
+                $value = $filter.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+                Write-Output "Filter field ${name}: $value"
+            }
+        }
         if ($table) {
             $chosen = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
             foreach ($row in $chosen) { Write-Output "Selected row: $($row.Current.Name); offscreen $($row.Current.IsOffscreen); automation ID $($row.Current.AutomationId)" }
