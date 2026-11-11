@@ -1,0 +1,106 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  workflows:
+    name: Workflow validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://rhysd/actionlint:1.7.12
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --bin console-ui --example instrumented
+      - name: Exercise native Windows UI
+        shell: pwsh
+        run: ./scripts/smoke-windows.ps1 -Executable ./target/debug/console-ui.exe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-windows-smoke
+          path: dist/smoke-*
+          retention-days: 14
+  linux-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-linux-desktop
+        timeout-minutes: 8
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked -p console-ui-gtk -- -D warnings
+      - run: cargo build --locked --example instrumented -p console-ui
+      - run: cargo build --locked -p console-ui-gtk
+      - name: Exercise GTK on X11
+        run: bash scripts/smoke-linux.sh x11
+      - name: Exercise GTK on Wayland
+        run: bash scripts/smoke-linux.sh wayland
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-linux-smoke
+          path: dist/smoke-linux-*
+          retention-days: 14
+  macos-native:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Typecheck Swift frontend
+        run: xcrun swiftc -swift-version 5 -typecheck -parse-as-library -import-objc-header platforms/macos/include/console_ui.h platforms/macos/Sources/ConsoleUI.swift
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: bash scripts/build-macos.sh dev
+      - run: cargo build --locked --example instrumented
+      - name: Exercise native SwiftUI frontend
+        run: bash scripts/smoke-macos.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-macos-smoke
+          path: dist/smoke-macos*
+          retention-days: 14

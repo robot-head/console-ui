@@ -49,8 +49,49 @@ while Reactor's public element references expose focus without bring-into-view.
 
 ## Release checks
 
-The native CI jobs build packages and run display-backed smoke coverage. Artifacts
-include ZIP/tar archives, checksums, logs, and screenshots. Public release publication,
+CI runs development builds and display-backed native smoke tests. The release
+workflow builds and tests extracted distribution archives. Artifacts include ZIP/tar
+archives, checksums, provenance manifests, logs, and screenshots. Public release publication,
 trusted Windows signing, macOS notarization, and a clean Windows 11 VM distribution
 check are explicit release-operator steps; they do not change the product feature
 milestones. Preview packages are not installers/updaters.
+
+## GitHub Actions
+
+[CI](../.github/workflows/ci.yml) runs on PRs, pushes to `master`, and manual dispatch.
+It is also reusable by the release workflow. It checks workflow syntax, formatting,
+Clippy, Rust tests, and native UI behavior on Windows 2025, Ubuntu 24.04 (X11 and
+Wayland), and macOS 15 Apple Silicon. CI builds the development macOS app with
+`bash scripts/build-macos.sh dev`; the release packager uses the same bundle builder
+in release mode. Smoke evidence is retained for 14 days.
+
+[Release builds](../.github/workflows/release.yml) support:
+
+- A pushed `v<Cargo version>` tag: validate all application versions, run reusable CI,
+  build and smoke-test all three extracted archives, verify asset checksums, and
+  create or refresh a **draft** GitHub release. Reruns refuse to replace published
+  release assets. The tag must already exist and still reference the built commit.
+- Manual dispatch: run the same checks and packaging, retaining download artifacts
+  for 30 days. A branch run produces preview artifacts; dispatching an existing
+  version tag also stages its draft release.
+- PRs changing workflows, native packaging, or smoke scripts: build/test previews
+  alongside normal CI, without creating a tag or GitHub release.
+
+The root and GTK `Cargo.toml` versions and both macOS bundle version fields must
+match. Update them together before tagging. For example, after merging the workflows:
+
+```sh
+gh workflow run release.yml --ref master
+# When releasing version 0.2.0 from the intended, reviewed commit:
+git tag v0.2.0 <commit>
+git push origin v0.2.0
+```
+
+Release archives are named `console-ui-<version>-windows-x64.zip`,
+`console-ui-<version>-linux-x86_64.tar.gz`, and
+`console-ui-<version>-macos-arm64.zip`. Each has a `.sha256` sidecar and a JSON
+manifest with schema version, application version, platform, source commit, archive
+name, and SHA-256 digest. Only the draft-release job receives `contents: write`;
+build and verification jobs use read access. Drafts require the release operator's
+signing/notarization and clean-machine checks before public publication. If signing
+changes an archive, regenerate its checksum and manifest before uploading it.

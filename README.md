@@ -288,9 +288,15 @@ The included instrumented workload exercises the real console-subscriber service
 A Windows UI type check from Linux is
 `cargo check --target x86_64-pc-windows-msvc --no-default-features --all-targets`
 (no runtime staging or TLS C compilation). Native linking/staging requires Windows.
-CI builds and tests the shared core, self-contained Windows package, GTK native app
-on X11 and Wayland, and SwiftUI app bundle on macOS. Native smoke tests inspect live
-tasks/resources and histograms, exercise Pause/Resume, and save screenshots.
+[CI](.github/workflows/ci.yml) runs on PRs and pushes to master: workflow validation,
+formatting, Clippy, all Rust tests, and native Windows, GTK X11/Wayland, and macOS
+smoke tests. Smoke logs, recordings, and screenshots are retained for 14 days.
 
-Product feature tracking is in [the roadmap](docs/roadmap.md). CI artifacts include
-packages and checksums; public release signing is a separate distribution step.
+[Release builds](.github/workflows/release.yml) run on `v*` tags or manual dispatch.
+They validate versions, run CI, build and test extracted native archives, and upload
+versioned packages, SHA-256 checksums, and source manifests for all three platforms.
+Tag builds stage a draft GitHub release. PRs changing build/workflow files also run
+packaging previews. See [release operation](docs/distribution.md#github-actions).
+
+Product feature tracking is in [the roadmap](docs/roadmap.md). Public signing and
+notarization remain release-operator steps.
