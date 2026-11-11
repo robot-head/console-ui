@@ -63,13 +63,13 @@ try {
     Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait('{END}')
     Wait-For {
-        $selected = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).GetCurrentSelection()
+        $selected = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
         $selected.Count -eq 1 -and $selected[0].Current.Name.Split(',')[0] -ne $firstId -and -not $selected[0].Current.IsOffscreen
     } 'keyboard-selected final row visible after scrolling' | Out-Null
     Capture 'keyboard-selection'
     [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
     Wait-For {
-        $selected = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).GetCurrentSelection()
+        $selected = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
         $selected.Count -eq 1 -and -not $selected[0].Current.IsOffscreen
     } 'keyboard-selected first row visible' | Out-Null
     Invoke-Name 'Inspect selected'
