@@ -45,7 +45,8 @@ pub enum Message {
     Lookup,
     FocusLookup,
     EditBookmark(u64),
-    Jump(Selection),
+    Jump(u64, Selection),
+    Timeline { tab: u64, session: u64, cursor: u64 },
     NativeSelection(Option<Selection>),
     Column { key: String, change: ColumnChange },
 }
@@ -176,7 +177,20 @@ impl Component for Workbench {
                         let _ = sender.send((tab, selected));
                     });
                 }
-                Message::Jump(selection) => {
+                Message::Timeline {
+                    tab,
+                    session,
+                    cursor,
+                } => {
+                    anyhow::ensure!(
+                        self.app.active == tab
+                            && self.app.current().worker.read().session == session,
+                        "The active investigation changed"
+                    );
+                    self.app.dispatch(Action::Seek { cursor })?;
+                }
+                Message::Jump(tab, selection) => {
+                    anyhow::ensure!(self.app.active == tab, "The active investigation changed");
                     anyhow::ensure!(
                         selection.session == self.app.current().worker.read().session,
                         "The runtime session changed; find the task again"
@@ -469,6 +483,16 @@ impl Workbench {
                 name: self.value("view_original", ""),
                 new_name: self.value("view_name", ""),
             },
+            "rename_preset" => Action::RenamePreset {
+                name: self.value("preset_name", ""),
+                new_name: self.value("preset_new_name", ""),
+                project: self
+                    .app
+                    .project_policy
+                    .presets
+                    .iter()
+                    .any(|p| p.name == self.value("preset_name", "")),
+            },
             "project_preset" => Action::SaveProjectPreset {
                 name: self.value("preset_name", ""),
             },
@@ -577,6 +601,7 @@ impl Workbench {
                     query: self.value("histogram_query", ""),
                     max_streams: self.value("histogram_limit", "4").parse()?,
                     rotate_seconds: self.value("histogram_rotation", "30").parse()?,
+                    collect_without_recording: false,
                 },
             },
             "bookmark" => Action::Bookmark {
@@ -654,6 +679,8 @@ impl Workbench {
     }
     fn filters(&self, c: &ViewContext<Self>) -> View {
         let mut controls=vec![heading("Filters and task lookup"),text("Combine clauses with AND (spaces), use | for OR, ! for negation, and quotes for values with spaces.").into(),self.entry("query","Filter expression",&self.app.current().document.filter,c),row(vec![button("Apply filter",c,Message::Apply("filter")),button("Clear",c,Message::Action(Action::Filter{expression:String::new()}))]),text("Examples: busy>5ms !state:completed   |   warning:self-wakes   |   field.request.id:123").into(),self.entry("preset_name","Preset name","",c),button("Save current filter as preset",c,Message::Apply("preset"))];
+        controls.push(self.entry("preset_new_name", "New preset name", "", c));
+        controls.push(button("Rename preset", c, Message::Apply("rename_preset")));
         controls.push(button(
             "Save preset in this project",
             c,
@@ -663,6 +690,20 @@ impl Workbench {
             .app
             .effective_preferences()
             .unwrap_or_else(|_| self.app.preferences.clone());
+        if let Some(active) = &self.app.current().document.active_preset {
+            let modified = effective
+                .filter_presets
+                .iter()
+                .find(|p| &p.name == active)
+                .is_none_or(|p| p.expression != self.app.current().document.filter);
+            controls.push(
+                text(&format!(
+                    "Active preset: {active}{}",
+                    if modified { " (query modified)" } else { "" }
+                ))
+                .into(),
+            );
+        }
         for p in &effective.filter_presets {
             controls.push(row(vec![
                 text(&p.name).into(),
@@ -713,11 +754,14 @@ impl Workbench {
                     task.id, task.name, task.state, task.location
                 ),
                 c,
-                Message::Jump(Selection {
-                    kind: "task".into(),
-                    id: task.id,
-                    session,
-                }),
+                Message::Jump(
+                    self.app.active,
+                    Selection {
+                        kind: "task".into(),
+                        id: task.id,
+                        session,
+                    },
+                ),
             ));
         }
         stack(controls)
@@ -908,17 +952,35 @@ impl Workbench {
                 );
             }
         }
+        controls.push(
+            text(
+                if view.selection.as_ref().is_some_and(|s| s.kind == "task") {
+                    "Charts show the selected task. Activate a chart to open its details."
+                } else {
+                    "Charts sum retained tasks. Select a task for its individual time series."
+                },
+            )
+            .into(),
+        );
         for metric in ["busy", "scheduled", "polls"] {
             if let Ok(svg) = crate::sharing::chart_svg(&view.trends, metric) {
-                controls.push(
-                    Image::new()
-                        .source_svg(EncodedImage::new(svg.into_bytes()))
-                        .height(240.0)
-                        .automation_name(format!(
-                            "{metric} time series; producer timestamps, gaps and units shown"
-                        ))
-                        .into(),
-                );
+                let chart = Image::new()
+                    .source_svg(EncodedImage::new(svg.into_bytes()))
+                    .height(240.0)
+                    .automation_name(format!(
+                        "{metric} time series; producer timestamps, gaps and units shown"
+                    ));
+                if let Some(selection) = view.selection.as_ref().filter(|s| s.kind == "task") {
+                    controls.push(
+                        Button::new()
+                            .content(chart)
+                            .automation_name(format!("Open chart task {}", selection.id))
+                            .on_click(c.message(Message::Jump(self.app.active, selection.clone())))
+                            .into(),
+                    );
+                } else {
+                    controls.push(chart.into());
+                }
             }
         }
         controls.extend([
@@ -985,11 +1047,14 @@ impl Workbench {
                     cells.push(button(
                         &format!("Inspect {key}"),
                         c,
-                        Message::Jump(Selection {
-                            kind: kind.into(),
-                            id,
-                            session: view.session,
-                        }),
+                        Message::Jump(
+                            self.app.active,
+                            Selection {
+                                kind: kind.into(),
+                                id,
+                                session: view.session,
+                            },
+                        ),
                     ));
                 }
             }
@@ -1007,6 +1072,10 @@ impl Workbench {
         };
         let mut controls = vec![
             heading("Recording and replay"),
+            text(view.histogram_notice.as_deref().unwrap_or(
+                "Histogram capture uses the configured subscription and rotation limits",
+            ))
+            .into(),
             row(vec![
                 button(
                     "Start recording…",
@@ -1056,6 +1125,34 @@ impl Workbench {
             ));
         }
         if let Some(cursor) = view.cursor {
+            if let Some(session) = view
+                .sessions
+                .iter()
+                .find(|s| s.index as u64 + 1 == view.session)
+            {
+                let start = session.start;
+                let end = session.end;
+                let tab = self.app.active;
+                let identity = view.session;
+                controls.push(
+                    Slider::new()
+                        .minimum(0.0)
+                        .maximum(((end - start) as f64 / 1e9).max(0.000001))
+                        .step_frequency(0.001)
+                        .value(cursor.saturating_sub(start) as f64 / 1e9)
+                        .automation_name("Recording timeline offset in seconds")
+                        .on_value_changed(c.callback(move |seconds: f64| {
+                            Message::Timeline {
+                                tab,
+                                session: identity,
+                                cursor: start
+                                    .saturating_add((seconds * 1e9).max(0.0) as u64)
+                                    .min(end),
+                            }
+                        }))
+                        .into(),
+                );
+            }
             controls.push(
                 text(&format!(
                     "Cursor {cursor} ns · {} · {:.1}x",
@@ -1120,16 +1217,45 @@ impl Workbench {
             for note in &comparison.notes {
                 controls.push(text(note).into());
             }
-            for r in &comparison.rows {
+            controls.push(row([
+                ("severity", "Rank regressions"),
+                ("name", "Sort by name"),
+                ("busy", "Sort by busy delta"),
+                ("scheduled", "Sort by scheduling delta"),
+                ("polls", "Sort by polling delta"),
+            ]
+            .into_iter()
+            .map(|(key, label)| button(label, c, Message::Text("comparison_sort", Rc::from(key))))
+            .collect()));
+            let mut rows = comparison.rows.iter().collect::<Vec<_>>();
+            let sort = self.value("comparison_sort", "severity");
+            if sort == "name" {
+                rows.sort_by(|a, b| a.name.cmp(&b.name));
+            } else if sort != "severity" {
+                rows.sort_by(|a, b| {
+                    let values = |r: &&crate::analysis::ComparisonRow| match sort.as_str() {
+                        "busy" => r.busy_per_second,
+                        "scheduled" => r.scheduled_per_second,
+                        _ => r.polls_per_second,
+                    };
+                    let aa = values(a);
+                    let bb = values(b);
+                    (bb[1] - bb[0]).total_cmp(&(aa[1] - aa[0]))
+                });
+            }
+            for r in rows {
                 if let Some(id) = r.current {
                     controls.push(button(
                         "Inspect current entity",
                         c,
-                        Message::Jump(Selection {
-                            kind: r.kind.clone(),
-                            id,
-                            session: self.app.current().worker.read().session,
-                        }),
+                        Message::Jump(
+                            self.app.active,
+                            Selection {
+                                kind: r.kind.clone(),
+                                id,
+                                session: self.app.current().worker.read().session,
+                            },
+                        ),
                     ));
                 }
                 controls.push(text(&format!("{} · {}\nBusy {:.2} → {:.2} ns/s · scheduled {:.2} → {:.2} ns/s · polling {:.2} → {:.2} polls/s",r.name,r.status,r.busy_per_second[0],r.busy_per_second[1],r.scheduled_per_second[0],r.scheduled_per_second[1],r.polls_per_second[0],r.polls_per_second[1])).into());
@@ -1426,8 +1552,16 @@ fn pick(action: Action) -> Option<Action> {
         _ => return None,
     })
 }
-pub fn run(settings: Settings, record: Option<PathBuf>, replay: Option<PathBuf>) -> Result<()> {
-    let app = Workspace::new(settings, record, replay)?;
+pub fn run(
+    settings: Settings,
+    record: Option<PathBuf>,
+    replay: Option<PathBuf>,
+    policy: Option<PathBuf>,
+) -> Result<()> {
+    let mut app = Workspace::new(settings, record, replay)?;
+    if let Some(path) = policy {
+        app.dispatch(Action::LoadPolicy { path })?;
+    }
     App::run_component_with_policy::<Workbench>(
         Input(Rc::new(RefCell::new(Some(app)))),
         WindowPolicy::new().minimum_client_size(1120.0, 700.0),

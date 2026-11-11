@@ -32,6 +32,15 @@ pub fn default_report_sections() -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+pub fn preserve_source(source: &Path, output: &Path) -> Result<()> {
+    if let (Ok(source), Ok(output)) = (source.canonicalize(), output.canonicalize()) {
+        ensure!(
+            source != output,
+            "Choose a new export path; the source recording must be preserved"
+        );
+    }
+    Ok(())
+}
 impl ExportDocument {
     pub fn new(session: u64, target: Option<String>, snapshot: Snapshot) -> Self {
         Self {
@@ -128,6 +137,30 @@ impl ExportDocument {
             }
         } else {
             anyhow::bail!("Unknown export table {table}");
+        }
+        rows[0].extend(
+            [
+                "range_start_ns",
+                "range_end_ns",
+                "dropped_events",
+                "counter_scope",
+                "availability",
+            ]
+            .map(str::to_owned),
+        );
+        for row in rows.iter_mut().skip(1) {
+            row.extend([
+                self.range.map_or(String::new(), |r| r[0].to_string()),
+                self.range.map_or(String::new(), |r| r[1].to_string()),
+                self.snapshot.dropped_events.to_string(),
+                "lifetime at cursor".into(),
+                if self.snapshot.dropped_events > 0 {
+                    "dropped events; evidence may be incomplete"
+                } else {
+                    "retained telemetry; histogram availability is reported in JSON"
+                }
+                .into(),
+            ]);
         }
         let csv = rows
             .into_iter()
@@ -399,6 +432,13 @@ impl RedactionPolicy {
                         serde_json::from_slice(&bytes)?;
                     if self.endpoints {
                         value.target = Some("[redacted]".into());
+                    }
+                    if !self.fields.is_empty() || self.source_paths || self.endpoints {
+                        if let Some(policy) = &mut value.histogram_policy {
+                            policy.query.clear();
+                        }
+                        value.histogram_note =
+                            Some("Capture policy query and notices removed for sharing".into());
                     }
                     writer.raw_frame(4, &serde_json::to_vec(&value)?)?;
                 }

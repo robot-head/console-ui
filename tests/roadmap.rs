@@ -376,6 +376,8 @@ fn assertions_distinguish_failures_missing_samples_and_invalid_configuration() {
     let rules = Rules {
         schema_version: 1,
         comparison_policy: Default::default(),
+        comparison_query: String::new(),
+        unavailable_exit_code: EXIT_UNAVAILABLE,
         rules: vec![Rule {
             name: "poll budget".into(),
             query: "name:worker".into(),
@@ -585,4 +587,289 @@ fn native_bridge_handles_errors_and_preserves_owned_string_lifetimes() {
         );
         console_ui_destroy(bridge);
     }
+}
+
+fn wait_for_jobs(app: &mut Workspace) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        app.tick().unwrap();
+        if app.pending == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Background controller operation timed out"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn async_recording_loads_preserve_tab_identity_and_restore_workspace_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let capture = dir.path().join("capture.tcui");
+    let mut recorder = Recorder::create(&capture).unwrap();
+    recorder.session("http://original:6669").unwrap();
+    recorder.update(&update(100, 1, 1, "worker")).unwrap();
+    recorder.update(&update(110, 11, 11, "worker")).unwrap();
+    recorder.flush().unwrap();
+    drop(recorder);
+    let mut app = Workspace::with_preferences(
+        Settings::default(),
+        dir.path().join("prefs.json"),
+        None,
+        Some(capture.clone()),
+    )
+    .unwrap();
+    assert_eq!(app.tabs.len(), 1);
+    let recording_tab = app.active;
+    let worker = app.current().worker.clone();
+    assert_eq!(
+        worker.read().status,
+        console_ui::telemetry::ConnectionStatus::Offline
+    );
+    app.dispatch(Action::AddTarget {
+        name: "other".into(),
+        target: "http://127.0.0.1:9".into(),
+    })
+    .unwrap();
+    let other = app.active;
+    wait_for_jobs(&mut app);
+    assert_eq!(
+        app.active, other,
+        "An asynchronous load must not steal the active tab"
+    );
+    app.dispatch(Action::SelectTab { id: recording_tab })
+        .unwrap();
+    assert!(Arc::ptr_eq(&worker, &app.current().worker));
+    assert!(!app.view().unwrap().trends.is_empty());
+    app.dispatch(Action::Seek {
+        cursor: 100_000_000_000,
+    })
+    .unwrap();
+    wait_for_jobs(&mut app);
+    assert_eq!(
+        app.current().worker.read().snapshot.tasks[0].timing.polls,
+        1
+    );
+    app.dispatch(Action::SelectInSession {
+        kind: "task".into(),
+        id: 1,
+        session: 99,
+    })
+    .unwrap_err();
+    app.dispatch(Action::Filter {
+        expression: "name:worker".into(),
+    })
+    .unwrap();
+    app.dispatch(Action::Select {
+        kind: "task".into(),
+        id: 1,
+    })
+    .unwrap();
+    let workspace = dir.path().join("workspace.json");
+    app.dispatch(Action::SaveWorkspace {
+        path: workspace.clone(),
+        name: "Investigation".into(),
+    })
+    .unwrap();
+    app.dispatch(Action::OpenWorkspace { path: workspace })
+        .unwrap();
+    wait_for_jobs(&mut app);
+    let view = app.view().unwrap();
+    assert_eq!(view.cursor, Some(100_000_000_000));
+    assert_eq!(view.query, "name:worker");
+    assert_eq!(view.selection.unwrap().id, 1);
+    assert_eq!(app.tabs.len(), 2);
+}
+
+#[test]
+fn history_marks_pause_boundaries_and_new_task_contributions() {
+    let mut history = History::default();
+    let mut first = sample(100, 1, 1);
+    first.tasks.clear();
+    history.push(1, &Arc::new(first));
+    history.push(1, &Arc::new(sample(101, 2, 2)));
+    assert_eq!(history.points()[0].polls_per_second, 2.0);
+    history.mark_gap();
+    history.push(1, &Arc::new(sample(102, 3, 3)));
+    assert!(history.points().last().unwrap().gap);
+    assert!(!history.window(&sample(102, 3, 3), 100_000_000_000).complete);
+    assert_eq!(history.points_for(Some(999))[0].busy_ns, 0);
+}
+
+#[test]
+fn graph_limits_keep_connected_tasks_and_resources_together() {
+    let mut snapshot = sample(101, 1, 1);
+    for id in 2..1000 {
+        let mut task = snapshot.tasks[0].clone();
+        task.id = id;
+        snapshot.tasks.push(task);
+    }
+    snapshot.resources.push(console_ui::model::ResourceRow {
+        id: 9,
+        kind: "Sync".into(),
+        concrete_type: "Mutex".into(),
+        target: String::new(),
+        location: String::new(),
+        attributes: String::new(),
+        internal: false,
+        parent: None,
+        total: 1,
+        completed: false,
+    });
+    snapshot.async_ops.push(console_ui::model::AsyncOpRow {
+        id: 8,
+        resource_id: 9,
+        task_id: Some(999),
+        task_name: "worker".into(),
+        source: "lock".into(),
+        attributes: String::new(),
+        timing: Default::default(),
+        completed: false,
+        ready: Some(false),
+    });
+    let graph = analysis::contention_graph(&snapshot, None, 8);
+    assert_eq!(graph.nodes.len(), 8);
+    assert_eq!(graph.edges.len(), 1);
+    assert!(graph.truncated);
+}
+
+#[test]
+fn cli_assertion_exit_codes_and_report_sections_are_observable() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    let capture = dir.path().join("input.tcui");
+    let config = dir.path().join("console.toml");
+    std::fs::write(&config, toml::to_string(&Settings::default()).unwrap()).unwrap();
+    let mut recorder = Recorder::create(&capture).unwrap();
+    recorder.session("http://original:6669").unwrap();
+    recorder.update(&update(100, 1, 1, "worker")).unwrap();
+    recorder.update(&update(110, 11, 11, "worker")).unwrap();
+    recorder.flush().unwrap();
+    drop(recorder);
+    let rules = dir.path().join("rules.json");
+    let run = |maximum: u64, metric: &str| {
+        std::fs::write(&rules,serde_json::to_vec(&serde_json::json!({"schema_version":1,"rules":[{"name":"budget","query":"name:worker","metric":metric,"maximum":maximum}]})).unwrap()).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_console-ui"))
+            .current_dir(dir.path())
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "check",
+                "--rules",
+                rules.to_str().unwrap(),
+                "--input",
+                capture.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let passed = run(100, "polls");
+    assert_eq!(
+        passed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&passed.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&passed.stdout).unwrap();
+    assert_eq!(report["results"][0]["unit"], "count");
+    assert_eq!(report["observation_seconds"], 10.0);
+    assert_eq!(run(2, "polls").status.code(), Some(1));
+    assert_eq!(run(10, "not-a-metric").status.code(), Some(2));
+    assert_eq!(run(10, "poll_p99_ns").status.code(), Some(3));
+    assert!(console_ui::sharing::preserve_source(&capture, &capture).is_err());
+    let mut document = ExportDocument::new(0, None, sample(101, 1, 1));
+    document.sections = vec!["charts".into()];
+    let output = dir.path().join("report.html");
+    document.report(&output, &[], None).unwrap();
+    let html = std::fs::read_to_string(output).unwrap();
+    assert!(!html.contains("<h2>Tasks"));
+    assert!(!html.contains("secret-value"));
+    assert!(html.contains("scheduled"));
+}
+
+#[test]
+fn future_histograms_delay_recording_seeds_and_pause_markers_invalidate_windows() {
+    let mut accumulator = Accumulator::default();
+    accumulator.apply(update(101, 1, 1, "worker"));
+    accumulator.apply_details(detail(105));
+    assert!(!accumulator.ready_to_record());
+    accumulator.apply(update(105, 5, 5, "worker"));
+    assert!(accumulator.ready_to_record());
+    let dir = tempfile::tempdir().unwrap();
+    let capture = dir.path().join("paused.tcui");
+    let mut writer = Recorder::create(&capture).unwrap();
+    writer.session("http://localhost:6669").unwrap();
+    let policy = HistogramPolicy {
+        mode: "matching".into(),
+        query: "name:worker".into(),
+        ..Default::default()
+    };
+    writer
+        .histogram_policy("http://localhost:6669", &policy, "sampled coverage")
+        .unwrap();
+    writer.update(&update(100, 1, 1, "worker")).unwrap();
+    writer
+        .pause_boundary("http://localhost:6669", 101_000_000_000, true)
+        .unwrap();
+    writer
+        .pause_boundary("http://localhost:6669", 101_000_000_000, false)
+        .unwrap();
+    writer.update(&update(102, 2, 2, "worker")).unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    let mut recording = Recording::open(&capture).unwrap();
+    assert_eq!(
+        recording.sessions[0].histogram_policy.as_ref().unwrap(),
+        &policy
+    );
+    assert!(
+        recording
+            .history(0, 102_000_000_000, &Settings::default())
+            .unwrap()
+            .points()[0]
+            .gap
+    );
+    assert!(
+        recording
+            .window(0, 100_000_000_000, 102_000_000_000, &Settings::default())
+            .is_err()
+    );
+}
+
+#[test]
+fn project_policy_and_cli_overrides_use_the_same_headless_thresholds() {
+    use clap::Parser;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("console.toml");
+    std::fs::write(&config, toml::to_string(&Settings::default()).unwrap()).unwrap();
+    let path = dir.path().join("policy.json");
+    console_ui::preferences::save_json(
+        &path,
+        &ProjectPolicy {
+            settings: Some(Settings {
+                lint_thresholds: LintThresholds {
+                    self_wake_percent: 90,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cli = console_ui::config::Cli::parse_from([
+        "console-ui",
+        "--config",
+        config.to_str().unwrap(),
+        "--policy",
+        path.to_str().unwrap(),
+        "--retain-for",
+        "none",
+        "gen-config",
+    ]);
+    let loaded = Settings::load(&cli).unwrap();
+    assert_eq!(loaded.lint_thresholds.self_wake_percent, 90);
+    assert_eq!(loaded.retain_for, "none");
 }

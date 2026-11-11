@@ -34,6 +34,9 @@ pub struct TabDocument {
     pub recording: Option<PathBuf>,
     pub filter: String,
     pub tables: BTreeMap<String, TablePreferences>,
+    pub view: Option<InvestigationView>,
+    pub histogram_policy: HistogramPolicy,
+    pub active_preset: Option<String>,
 }
 impl Default for TabDocument {
     fn default() -> Self {
@@ -44,6 +47,9 @@ impl Default for TabDocument {
             recording: None,
             filter: String::new(),
             tables: BTreeMap::new(),
+            view: None,
+            histogram_policy: Default::default(),
+            active_preset: None,
         }
     }
 }
@@ -192,6 +198,12 @@ pub enum Action {
     DeletePreset {
         name: String,
     },
+    RenamePreset {
+        name: String,
+        new_name: String,
+        #[serde(default)]
+        project: bool,
+    },
     ApplyPreset {
         name: String,
     },
@@ -208,6 +220,13 @@ pub enum Action {
     },
     Settings {
         settings: Settings,
+    },
+    Appearance {
+        palette: crate::config::Palette,
+    },
+    LintEnabled {
+        lint: crate::config::Lint,
+        enabled: bool,
     },
     StartRecording {
         path: PathBuf,
@@ -320,6 +339,8 @@ pub struct View {
     pub inspection: Snapshot,
     pub lookup_tasks: Vec<TaskRow>,
     pub export_preview: Option<ExportDocument>,
+    pub histogram_policy: HistogramPolicy,
+    pub histogram_notice: Option<String>,
     pub report_sections: Vec<String>,
     pub project_presets: Vec<String>,
     pub unfiltered_counts: [usize; 3],
@@ -342,6 +363,11 @@ pub struct View {
 }
 
 impl Workspace {
+    pub fn shutdown(&self) {
+        for tab in &self.tabs {
+            tab.worker.shutdown();
+        }
+    }
     pub fn new(
         settings: Settings,
         record: Option<PathBuf>,
@@ -445,6 +471,7 @@ impl Workspace {
                 name,
                 target: target.clone(),
                 tables: self.preferences.tables.clone(),
+                histogram_policy: self.preferences.histogram_policy.clone(),
                 ..Default::default()
             },
             worker,
@@ -454,13 +481,16 @@ impl Workspace {
             playback: None,
             investigation: None,
             window_ns: None,
-            policy: HistogramPolicy::default(),
+            policy: self.preferences.histogram_policy.clone(),
             last_session: 0,
             seek_generation: 0,
             seeking: false,
             seek_request: None,
         });
         self.active = id;
+        self.current()
+            .worker
+            .send(Command::HistogramPolicy(self.current().policy.clone()));
         self.preferences.remember(&target)?;
         self.persist()
     }
@@ -482,6 +512,9 @@ impl Workspace {
                 tables: restore
                     .as_ref()
                     .map_or(self.preferences.tables.clone(), |v| v.tables.clone()),
+                view: restore.clone(),
+                histogram_policy: Default::default(),
+                active_preset: None,
             },
             worker,
             history: History::default(),
@@ -670,13 +703,15 @@ impl Workspace {
                 self.pending += 1;
                 let mut recording = tab.recording.as_ref().unwrap().fork();
                 let settings = self.settings.clone();
+                let history = tab.history.clone();
                 let sender = self.jobs.clone();
                 let id = tab.document.id;
                 let generation = tab.seek_generation;
                 std::thread::spawn(move || {
                     let result = (|| -> Result<Box<Seeked>> {
                         let snapshot = recording.seek(session, cursor, &settings)?;
-                        let history = recording.history(session, cursor, &settings)?;
+                        let history =
+                            recording.extend_history(history, session, cursor, &settings)?;
                         Ok(Box::new(Seeked {
                             recording,
                             snapshot,
@@ -694,6 +729,10 @@ impl Workspace {
             let live = tab.worker.read();
             if live.session != tab.last_session {
                 tab.selection = None;
+                if tab.last_session > 0 && tab.policy.mode == "selected" {
+                    tab.policy.tasks.clear();
+                    tab.document.histogram_policy.tasks.clear();
+                }
                 tab.last_session = live.session;
             }
             if tab
@@ -712,6 +751,8 @@ impl Workspace {
             }
             if !live.paused && live.status == ConnectionStatus::Connected {
                 tab.history.push(live.session, &live.snapshot);
+            } else if tab.document.recording.is_none() {
+                tab.history.mark_gap();
             }
         }
         Ok(())
@@ -853,6 +894,9 @@ impl Workspace {
                 if let Some(t) = self.tabs.iter().find(|t| t.document.id == id) {
                     t.worker.send(Command::StopRecording);
                 }
+                if let Some(tab) = self.tabs.iter().find(|t| t.document.id == id) {
+                    tab.worker.shutdown();
+                }
                 self.tabs.retain(|t| t.document.id != id);
                 if self.active == id {
                     self.active = self.tabs[0].document.id;
@@ -887,6 +931,7 @@ impl Workspace {
                     "Target is not connected"
                 );
                 worker.send(Command::Pause(!live.paused));
+                self.notice = Some("Pause/resume changes the subscriber server and affects every observer of this endpoint, including duplicate target tabs".into());
             }
             Action::Filter { expression } => {
                 Query::parse(&expression)?;
@@ -934,7 +979,8 @@ impl Workspace {
                     "This name belongs to a project preset; update the project preset or choose another name"
                 );
                 self.preferences
-                    .set_preset(name, self.current().document.filter.clone())?;
+                    .set_preset(name.clone(), self.current().document.filter.clone())?;
+                self.current_mut().document.active_preset = Some(name);
                 self.persist()?;
             }
             Action::DeletePreset { name } => {
@@ -946,9 +992,11 @@ impl Workspace {
                 let expression = self.current().document.filter.clone();
                 Query::parse(&expression)?;
                 self.project_policy.presets.retain(|p| p.name != name);
-                self.project_policy
-                    .presets
-                    .push(preferences::FilterPreset { name, expression });
+                self.project_policy.presets.push(preferences::FilterPreset {
+                    name: name.clone(),
+                    expression,
+                });
+                self.current_mut().document.active_preset = Some(name);
             }
             Action::DeleteProjectPreset { name } => {
                 self.project_policy.presets.retain(|p| p.name != name)
@@ -963,6 +1011,36 @@ impl Workspace {
                     .expression
                     .clone();
                 self.dispatch(Action::Filter { expression })?;
+                self.current_mut().document.active_preset = Some(name);
+            }
+            Action::RenamePreset {
+                name,
+                new_name,
+                project,
+            } => {
+                ensure!(!new_name.trim().is_empty(), "Preset needs a name");
+                let presets = if project {
+                    &mut self.project_policy.presets
+                } else {
+                    &mut self.preferences.filter_presets
+                };
+                ensure!(
+                    !presets.iter().any(|p| p.name == new_name),
+                    "A preset with that name already exists"
+                );
+                presets
+                    .iter_mut()
+                    .find(|p| p.name == name)
+                    .context("Preset is unavailable")?
+                    .name = new_name.clone();
+                for tab in &mut self.tabs {
+                    if tab.document.active_preset.as_ref() == Some(&name) {
+                        tab.document.active_preset = Some(new_name.clone());
+                    }
+                }
+                if !project {
+                    self.persist()?;
+                }
             }
             Action::Table { table, preferences } => {
                 preferences.validate()?;
@@ -978,6 +1056,7 @@ impl Workspace {
                 self.persist()?;
             }
             Action::Editor { preferences } => {
+                preferences.validate()?;
                 self.preferences.editor = preferences;
                 self.persist()?;
             }
@@ -1022,6 +1101,20 @@ impl Workspace {
                     self.preferences.settings = settings;
                     self.persist()?;
                 }
+            }
+            Action::Appearance { palette } => {
+                let mut settings = self.settings.clone();
+                settings.palette = palette;
+                self.dispatch(Action::Settings { settings })?;
+            }
+            Action::LintEnabled { lint, enabled } => {
+                let mut settings = self.settings.clone();
+                if enabled {
+                    settings.warnings.insert(lint);
+                } else {
+                    settings.warnings.remove(&lint);
+                }
+                self.dispatch(Action::Settings { settings })?;
             }
             Action::StartRecording { path } => {
                 ensure!(
@@ -1083,7 +1176,10 @@ impl Workspace {
                 self.current()
                     .worker
                     .send(Command::HistogramPolicy(policy.clone()));
-                self.current_mut().policy = policy;
+                self.current_mut().document.histogram_policy = policy.clone();
+                self.current_mut().policy = policy.clone();
+                self.preferences.histogram_policy = policy;
+                self.persist()?;
             }
             Action::Bookmark { name, note } => {
                 ensure!(!name.trim().is_empty(), "Bookmark needs a name");
@@ -1209,7 +1305,31 @@ impl Workspace {
                         schema_version: 1,
                         name: self.name.clone(),
                         active: self.active,
-                        tabs: self.tabs.iter().map(|t| t.document.clone()).collect(),
+                        tabs: self
+                            .tabs
+                            .iter()
+                            .map(|t| {
+                                let mut document = t.document.clone();
+                                if let Some(p) = &t.playback {
+                                    document.view = Some(InvestigationView {
+                                        name: document.name.clone(),
+                                        recording: document.recording.clone(),
+                                        session: p.session,
+                                        cursor: p.cursor,
+                                        range: t
+                                            .window_ns
+                                            .map(|ns| [p.cursor.saturating_sub(ns), p.cursor]),
+                                        filter: document.filter.clone(),
+                                        tables: document.tables.clone(),
+                                        selected: t
+                                            .selection
+                                            .as_ref()
+                                            .map(|s| (s.kind.clone(), s.id)),
+                                    });
+                                }
+                                document
+                            })
+                            .collect(),
                         policy: ProjectPolicy {
                             schema_version: 1,
                             settings: Some(self.settings.clone()),
@@ -1245,6 +1365,7 @@ impl Workspace {
                         crate::config::validate_target(&t.target)?;
                     }
                 }
+                self.shutdown();
                 self.tabs.clear();
                 self.views = document.views;
                 self.name = document.name;
@@ -1256,12 +1377,24 @@ impl Workspace {
                 for t in document.tabs {
                     let old_id = t.id;
                     if let Some(path) = t.recording {
-                        self.open_recording(path, false, None);
+                        let restoring = t.view.is_some();
+                        self.open_recording(path, false, t.view);
+                        if !restoring {
+                            let tab = self.current_mut();
+                            tab.document.filter = t.filter;
+                            tab.document.tables = t.tables;
+                        }
                     } else {
                         self.add_target(t.target, t.name, None)?;
                         let tab = self.current_mut();
                         tab.document.filter = t.filter;
                         tab.document.tables = t.tables;
+                        tab.policy = t.histogram_policy.clone();
+                        if tab.policy.mode == "selected" {
+                            tab.policy.tasks.clear();
+                        }
+                        tab.worker
+                            .send(Command::HistogramPolicy(tab.policy.clone()));
                     }
                     if old_id == wanted {
                         active = Some(self.active);
@@ -1280,6 +1413,7 @@ impl Workspace {
                     "Wait for current file operations to finish before switching workspaces"
                 );
                 ensure!(!name.trim().is_empty(), "Workspace needs a name");
+                self.shutdown();
                 self.tabs.clear();
                 self.views.clear();
                 self.name = name;
@@ -1374,6 +1508,9 @@ impl Workspace {
                 redaction,
             } => {
                 let tab = self.current();
+                if let Some(source) = &tab.document.recording {
+                    crate::sharing::preserve_source(source, &path)?;
+                }
                 let live = tab.worker.read();
                 let snapshot = Query::parse(&tab.document.filter)?.filter(&live.snapshot);
                 let mut document = ExportDocument::new(live.session, Some(live.target), snapshot);
@@ -1492,6 +1629,8 @@ impl Workspace {
                 .map_or(vec![], |q| self.find_tasks(q)),
             export_preview,
             report_sections: self.report_sections.clone(),
+            histogram_policy: tab.policy.clone(),
+            histogram_notice: live.histogram_notice.clone(),
             project_presets: self
                 .project_policy
                 .presets
@@ -1527,7 +1666,12 @@ impl Workspace {
             selection: selected,
             trends: tab
                 .history
-                .points()
+                .points_for(
+                    tab.selection
+                        .as_ref()
+                        .filter(|s| s.kind == "task")
+                        .map(|s| s.id),
+                )
                 .into_iter()
                 .filter(|p| {
                     p.now <= live.snapshot.now
@@ -1560,5 +1704,11 @@ impl Workspace {
             pending: self.pending,
             snapshot,
         })
+    }
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

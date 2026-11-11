@@ -53,6 +53,34 @@ impl Recorder {
             4,
             &serde_json::to_vec(&crate::investigation::SessionMetadata {
                 target: Some(target.into()),
+                ..Default::default()
+            })?,
+        )
+    }
+    pub fn histogram_policy(
+        &mut self,
+        target: &str,
+        policy: &crate::telemetry::HistogramPolicy,
+        note: &str,
+    ) -> Result<()> {
+        self.frame(
+            4,
+            &serde_json::to_vec(&crate::investigation::SessionMetadata {
+                target: Some(target.into()),
+                histogram_policy: Some(policy.clone()),
+                histogram_note: Some(note.into()),
+                ..Default::default()
+            })?,
+        )
+    }
+    pub fn pause_boundary(&mut self, target: &str, at_ns: u64, paused: bool) -> Result<()> {
+        self.frame(
+            4,
+            &serde_json::to_vec(&crate::investigation::SessionMetadata {
+                target: Some(target.into()),
+                at_ns: Some(at_ns),
+                paused: Some(paused),
+                ..Default::default()
             })?,
         )
     }

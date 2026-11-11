@@ -20,6 +20,14 @@ use std::{
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionMetadata {
     pub target: Option<String>,
+    #[serde(default)]
+    pub histogram_policy: Option<crate::telemetry::HistogramPolicy>,
+    #[serde(default)]
+    pub histogram_note: Option<String>,
+    #[serde(default)]
+    pub paused: Option<bool>,
+    #[serde(default)]
+    pub at_ns: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -29,6 +37,8 @@ pub struct SessionInfo {
     pub updates: u64,
     pub target: Option<String>,
     pub incomplete: bool,
+    pub histogram_policy: Option<crate::telemetry::HistogramPolicy>,
+    pub histogram_note: Option<String>,
 }
 #[derive(Clone, Copy)]
 struct Frame {
@@ -36,19 +46,21 @@ struct Frame {
     kind: u8,
     time: u64,
     session: usize,
+    gap: bool,
 }
 struct Checkpoint {
     frame: usize,
     session: usize,
     time: u64,
-    accumulator: Accumulator,
+    accumulator: Arc<Accumulator>,
+    estimated_bytes: usize,
 }
 pub struct Recording {
     pub path: PathBuf,
     pub sessions: Vec<SessionInfo>,
     pub warnings: Vec<String>,
     frames: Arc<Vec<Frame>>,
-    checkpoints: VecDeque<Checkpoint>,
+    checkpoints: VecDeque<Arc<Checkpoint>>,
 }
 pub(crate) fn read_frame(reader: &mut (impl Read + Seek)) -> Result<Option<(u8, Vec<u8>)>> {
     let mut kind = [0];
@@ -128,10 +140,13 @@ impl Recording {
                     updates: 0,
                     target: None,
                     incomplete: false,
+                    histogram_policy: None,
+                    histogram_note: None,
                 });
                 pending = false;
             }
             let mut frame_time = now;
+            let mut gap = false;
             match kind {
                 1 => {
                     let update = Update::decode(bytes.as_slice())?;
@@ -158,7 +173,17 @@ impl Recording {
                 }
                 4 => {
                     let metadata: SessionMetadata = serde_json::from_slice(&bytes)?;
-                    recording.sessions[session].target = metadata.target;
+                    if metadata.target.is_some() {
+                        recording.sessions[session].target = metadata.target;
+                    }
+                    if metadata.histogram_policy.is_some() {
+                        recording.sessions[session].histogram_policy = metadata.histogram_policy;
+                    }
+                    if metadata.histogram_note.is_some() {
+                        recording.sessions[session].histogram_note = metadata.histogram_note;
+                    }
+                    gap = metadata.paused.is_some();
+                    frame_time = metadata.at_ns.unwrap_or(frame_time);
                 }
                 _ => bail!("Unknown recording frame type {kind}"),
             }
@@ -167,6 +192,7 @@ impl Recording {
                 kind,
                 time: frame_time,
                 session,
+                gap,
             });
             ensure!(
                 recording.frames.len() <= 5_000_000,
@@ -182,7 +208,7 @@ impl Recording {
             sessions: self.sessions.clone(),
             warnings: self.warnings.clone(),
             frames: self.frames.clone(),
-            checkpoints: VecDeque::new(),
+            checkpoints: self.checkpoints.clone(),
         }
     }
     /// Build a bounded trend history in one streaming pass, without retaining a
@@ -193,19 +219,56 @@ impl Recording {
         cursor: u64,
         settings: &Settings,
     ) -> Result<crate::analysis::History> {
-        let mut history = crate::analysis::History::default();
-        let mut accumulator = Accumulator::default();
+        self.extend_history(
+            crate::analysis::History::default(),
+            session,
+            cursor,
+            settings,
+        )
+    }
+    pub fn extend_history(
+        &self,
+        mut history: crate::analysis::History,
+        session: usize,
+        cursor: u64,
+        settings: &Settings,
+    ) -> Result<crate::analysis::History> {
+        if let Some((old, first, last)) = history.bounds() {
+            if old == session as u64 + 1 && (first..=last).contains(&cursor) {
+                return Ok(history);
+            }
+            if old != session as u64 + 1 || cursor < first {
+                history = crate::analysis::History::default();
+            }
+        }
+        let last = history.bounds().map(|(_, _, last)| last);
+        let checkpoint = last.and_then(|last| {
+            self.checkpoints
+                .iter()
+                .filter(|c| c.session == session && c.time <= last)
+                .max_by_key(|c| c.frame)
+        });
+        let (mut accumulator, start) = checkpoint.map_or_else(
+            || (Accumulator::default(), 0),
+            |c| ((*c.accumulator).clone(), c.frame + 1),
+        );
         let mut reader = BufReader::new(File::open(&self.path)?);
         let since = cursor.saturating_sub(900_000_000_000);
-        for frame in self
-            .frames
-            .iter()
-            .filter(|f| f.session == session && f.time <= cursor && f.kind == 1)
+        for frame in
+            self.frames.iter().skip(start).filter(|f| {
+                f.session == session && f.time <= cursor && (f.kind == 1 || f.kind == 4)
+            })
         {
             reader.seek(SeekFrom::Start(frame.offset))?;
             let (_, bytes) = read_frame(&mut reader)?.context("Recording changed while reading")?;
+            if frame.kind == 4 {
+                if frame.gap {
+                    history.mark_gap();
+                }
+                continue;
+            }
             accumulator.apply(Update::decode(bytes.as_slice())?);
-            if frame.time >= since {
+            if frame.time >= since && last.is_none_or(|last| frame.time > last) {
                 history.push(
                     session as u64 + 1,
                     &Arc::new(accumulator.snapshot(&settings.warnings)),
@@ -229,7 +292,7 @@ impl Recording {
             .filter(|c| c.session == session && c.time <= cursor)
             .max_by_key(|c| c.frame);
         let (mut accumulator, start) = checkpoint
-            .map(|c| (c.accumulator.clone(), c.frame + 1))
+            .map(|c| ((*c.accumulator).clone(), c.frame + 1))
             .unwrap_or((Accumulator::default(), 0));
         let mut reader = BufReader::new(File::open(&self.path)?);
         let mut last: Option<(usize, u64)> = None;
@@ -271,13 +334,34 @@ impl Recording {
         if let Some((frame, time, accumulator)) = checkpoint
             && self.checkpoints.iter().all(|c| c.frame != frame)
         {
-            self.checkpoints.push_back(Checkpoint {
-                frame,
-                session,
-                time,
-                accumulator,
-            });
-            while self.checkpoints.len() > 4 {
+            let estimated_bytes = accumulator
+                .wire_snapshot()
+                .encoded_len()
+                .saturating_mul(4)
+                .saturating_add(
+                    accumulator
+                        .wire_details()
+                        .iter()
+                        .map(|d| d.encoded_len().saturating_mul(2))
+                        .sum::<usize>(),
+                );
+            if estimated_bytes <= 8 * 1024 * 1024 {
+                self.checkpoints.push_back(Arc::new(Checkpoint {
+                    frame,
+                    session,
+                    time,
+                    accumulator: Arc::new(accumulator),
+                    estimated_bytes,
+                }));
+            }
+            while self.checkpoints.len() > 4
+                || self
+                    .checkpoints
+                    .iter()
+                    .map(|c| c.estimated_bytes)
+                    .sum::<usize>()
+                    > 32 * 1024 * 1024
+            {
                 self.checkpoints.pop_front();
             }
         }
@@ -318,6 +402,13 @@ impl Recording {
             end > start,
             "An analysis window must have positive duration"
         );
+        ensure!(
+            !self
+                .frames
+                .iter()
+                .any(|f| f.session == session && f.gap && f.time > start && f.time <= end),
+            "Recording interval contains a pause/resume boundary"
+        );
         let mut complete_settings = settings.clone();
         complete_settings.retain_for = "none".into();
         let settings = &complete_settings;
@@ -353,6 +444,26 @@ pub struct InvestigationView {
     pub tables: std::collections::BTreeMap<String, TablePreferences>,
     pub selected: Option<(String, u64)>,
 }
+impl InvestigationView {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(!self.name.trim().is_empty(), "View needs a name");
+        crate::query::Query::parse(&self.filter)?;
+        for preferences in self.tables.values() {
+            preferences.validate()?;
+        }
+        ensure!(
+            self.range.is_none_or(|r| r[1] > r[0]),
+            "View range must have positive duration"
+        );
+        ensure!(
+            self.selected
+                .as_ref()
+                .is_none_or(|(kind, _)| ["task", "resource", "operation"].contains(&kind.as_str())),
+            "Unknown selected entity kind"
+        );
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Investigation {
     pub schema_version: u32,
@@ -381,7 +492,7 @@ impl Investigation {
             "Unsupported investigation version"
         );
         for view in &result.views {
-            crate::query::Query::parse(&view.filter)?;
+            view.validate()?;
         }
         Ok(result)
     }

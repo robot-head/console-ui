@@ -356,6 +356,7 @@ name = "console-ui-gtk"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "clap",
  "console-ui",
  "humantime",
  "relm4",

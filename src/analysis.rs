@@ -33,6 +33,7 @@ pub struct Sample {
     pub now: u64,
     pub dropped_events: u64,
     pub tasks: BTreeMap<u64, Counters>,
+    pub gap: bool,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TrendPoint {
@@ -42,11 +43,13 @@ pub struct TrendPoint {
     pub polls_per_second: f64,
     pub gap: bool,
 }
+#[derive(Clone)]
 pub struct History {
     samples: VecDeque<Sample>,
     bytes: usize,
     budget: usize,
     duration_ns: u64,
+    gap_pending: bool,
 }
 impl Default for History {
     fn default() -> Self {
@@ -54,12 +57,19 @@ impl Default for History {
     }
 }
 impl History {
+    pub fn bounds(&self) -> Option<(u64, u64, u64)> {
+        self.samples
+            .front()
+            .zip(self.samples.back())
+            .map(|(a, b)| (a.session, a.now, b.now))
+    }
     pub fn new(budget: usize, duration_ns: u64) -> Self {
         Self {
             samples: VecDeque::new(),
             bytes: 0,
             budget: budget.max(1024),
             duration_ns,
+            gap_pending: false,
         }
     }
     pub fn push(&mut self, session: u64, snapshot: &Arc<Snapshot>) {
@@ -82,6 +92,7 @@ impl History {
             session,
             now: snapshot.now,
             dropped_events: snapshot.dropped_events,
+            gap: std::mem::take(&mut self.gap_pending),
             tasks: snapshot
                 .tasks
                 .iter()
@@ -110,18 +121,27 @@ impl History {
             }
         }
     }
+    pub fn mark_gap(&mut self) {
+        self.gap_pending = true;
+    }
     pub fn points(&self) -> Vec<TrendPoint> {
+        self.points_for(None)
+    }
+    pub fn points_for(&self, task: Option<u64>) -> Vec<TrendPoint> {
         self.samples
             .iter()
             .zip(self.samples.iter().skip(1))
             .map(|(a, b)| {
                 let mut point = TrendPoint {
                     now: b.now,
-                    gap: b.dropped_events > a.dropped_events || b.now <= a.now,
+                    gap: b.gap || b.dropped_events > a.dropped_events || b.now <= a.now,
                     ..Default::default()
                 };
                 let mut polls = 0u64;
                 for (id, end) in &b.tasks {
+                    if task.is_some_and(|task| task != *id) {
+                        continue;
+                    }
                     let zero = Counters::default();
                     if let Some(start) = a
                         .tasks
@@ -194,8 +214,18 @@ impl History {
             .tasks
             .keys()
             .any(|id| !current.tasks.iter().any(|t| t.id == *id));
+        tasks.sort_by(|a, b| {
+            b.busy_ns
+                .cmp(&a.busy_ns)
+                .then(b.scheduled_ns.cmp(&a.scheduled_ns))
+                .then(a.id.cmp(&b.id))
+        });
         let complete = anchor.now <= since
             && anchor.dropped_events == current.dropped_events
+            && !self
+                .samples
+                .iter()
+                .any(|s| s.now > anchor.now && s.now <= current.now && s.gap)
             && tasks.iter().all(|t| t.available)
             && !missing;
         WindowSummary { start:anchor.now, end:current.now, complete, tasks,
@@ -630,6 +660,34 @@ pub fn compare(
             warnings_removed: aw.difference(bw).cloned().collect(),
         });
     }
-    rows.sort_by_key(|r| (!r.regression, r.kind.clone(), r.name.clone()));
+    let score = |r: &ComparisonRow| {
+        [
+            r.busy_per_second,
+            r.scheduled_per_second,
+            r.polls_per_second,
+        ]
+        .into_iter()
+        .map(|v| (v[1] - v[0]) / v[0].max(1.0))
+        .fold(0.0, f64::max)
+    };
+    for row in &mut rows {
+        if row.status == "matched"
+            && ((row.busy_per_second[0] - row.busy_per_second[1] > policy.absolute_ns as f64)
+                || (row.scheduled_per_second[0] - row.scheduled_per_second[1]
+                    > policy.absolute_ns as f64)
+                || (row.polls_per_second[0] - row.polls_per_second[1]
+                    > policy.polls_increase as f64))
+        {
+            row.status = "improvement".into();
+        }
+    }
+    rows.sort_by(|a, b| {
+        b.regression
+            .cmp(&a.regression)
+            .then_with(|| score(b).total_cmp(&score(a)))
+            .then(a.kind.cmp(&b.kind))
+            .then(a.name.cmp(&b.name))
+            .then(a.key.cmp(&b.key))
+    });
     Ok(Comparison { schema_version:1,rows,notes:vec!["Entities match by source, target, kind and name; resource operations also include their task/resource identity. Duplicate identities are ambiguous, never asserted as regressions.".into(),"Rates use observation-window deltas. Resource busy/poll rates aggregate its operations. Missing or outlier-limited histograms are unknown. Added/removed entities follow the configured policy.".into()] })
 }

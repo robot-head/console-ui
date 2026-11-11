@@ -1,8 +1,8 @@
 //! Native GTK4 widgets driven by a Relm4 component and the shared Rust controller.
+use clap::Parser;
 use console_ui::{
     config::{LintThresholds, Palette},
     model::{ResourceRow, Snapshot, TaskRow},
-    preferences::Preferences,
     sharing::RedactionPolicy,
     workspace::{Action, Workspace},
 };
@@ -22,10 +22,12 @@ struct App {
     smoke_step: u8,
     started: Instant,
     done: bool,
+    closing: bool,
 }
 #[derive(Debug)]
 enum Msg {
     Tick,
+    Shutdown,
     Action(Action),
     Select { kind: String, id: u64, session: u64 },
     InspectTask(u64),
@@ -79,6 +81,13 @@ impl SimpleComponent for App {
         let outer = vertical();
         outer.set_margin_all(12);
         window.set_child(Some(&outer));
+        {
+            let sender = sender.clone();
+            window.connect_close_request(move |_| {
+                sender.input(Msg::Shutdown);
+                glib::Propagation::Stop
+            });
+        }
         let title = gtk::Label::new(Some("Runtime observatory"));
         title.add_css_class("title-1");
         title.set_halign(gtk::Align::Start);
@@ -258,6 +267,20 @@ impl SimpleComponent for App {
             thresholds.append(&button);
         }
         analysis_page.append(&thresholds);
+        let lints = horizontal();
+        for lint in console_ui::config::Lint::ALL {
+            let check = gtk::CheckButton::with_label(lint.name());
+            check.set_active(workspace.settings.warnings.contains(&lint));
+            let sender = sender.clone();
+            check.connect_toggled(move |check| {
+                sender.input(Msg::Action(Action::LintEnabled {
+                    lint,
+                    enabled: check.is_active(),
+                }))
+            });
+            lints.append(&check);
+        }
+        analysis_page.append(&lints);
         notebook.append_page(
             &scrolled(&analysis_page),
             Some(&gtk::Label::new(Some("Analysis"))),
@@ -372,6 +395,7 @@ impl SimpleComponent for App {
                                 query: query.text().into(),
                                 max_streams: limit.text().parse()?,
                                 rotate_seconds: rotation.text().parse()?,
+                                collect_without_recording: false,
                             },
                         })
                     })(),
@@ -453,6 +477,20 @@ impl SimpleComponent for App {
         }
         let lookup = vertical();
         connections.append(&lookup);
+        let old_preset = entry("Preset to rename", "");
+        let new_preset = entry("New preset name", "");
+        connections.append(&old_preset);
+        connections.append(&new_preset);
+        connect_button(
+            &connections,
+            "Rename global preset",
+            sender.clone(),
+            move || Action::RenamePreset {
+                name: old_preset.text().into(),
+                new_name: new_preset.text().into(),
+                project: false,
+            },
+        );
         let presets = vertical();
         connections.append(&presets);
         notebook.append_page(
@@ -460,8 +498,49 @@ impl SimpleComponent for App {
             Some(&gtk::Label::new(Some("Connections"))),
         );
         let project = vertical();
+        let appearance = gtk::DropDown::from_strings(&["System appearance", "Light", "Dark"]);
+        appearance.set_selected(match workspace.settings.palette {
+            Palette::System => 0,
+            Palette::Light => 1,
+            Palette::Dark => 2,
+        });
+        {
+            let sender = sender.clone();
+            appearance.connect_selected_notify(move |selection| {
+                sender.input(Msg::Action(Action::Appearance {
+                    palette: match selection.selected() {
+                        1 => Palette::Light,
+                        2 => Palette::Dark,
+                        _ => Palette::System,
+                    },
+                }))
+            });
+        }
+        project.append(&appearance);
         let name = entry("Workspace / view name", "My investigation");
         project.append(&name);
+        let original = entry("Existing view to rename or duplicate", "");
+        project.append(&original);
+        {
+            let old = original.clone();
+            let next = name.clone();
+            connect_button(&project, "Rename view", sender.clone(), move || {
+                Action::RenameView {
+                    name: old.text().into(),
+                    new_name: next.text().into(),
+                }
+            });
+        }
+        {
+            let old = original.clone();
+            let next = name.clone();
+            connect_button(&project, "Duplicate view", sender.clone(), move || {
+                Action::DuplicateView {
+                    name: old.text().into(),
+                    new_name: next.text().into(),
+                }
+            });
+        }
         let source = name.clone();
         connect_button(
             &project,
@@ -692,6 +771,7 @@ impl SimpleComponent for App {
                 smoke_step: 0,
                 started: Instant::now(),
                 done: false,
+                closing: false,
             },
             widgets: Widgets {
                 window,
@@ -723,6 +803,11 @@ impl SimpleComponent for App {
     fn update(&mut self, message: Msg, _: ComponentSender<Self>) {
         let result = match message {
             Msg::Tick => self.workspace.tick(),
+            Msg::Shutdown => {
+                self.workspace.shutdown();
+                self.closing = true;
+                Ok(())
+            }
             Msg::Action(action) => {
                 self.revision += 1;
                 self.workspace.dispatch(action)
@@ -787,6 +872,17 @@ impl SimpleComponent for App {
         }
     }
     fn update_view(&self, w: &mut Widgets, sender: ComponentSender<Self>) {
+        if self.closing {
+            if let Some(app) = w.window.application() {
+                app.quit();
+            }
+            return;
+        }
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_gtk_application_prefer_dark_theme(
+                self.workspace.settings.palette == Palette::Dark,
+            );
+        }
         let view = match self.workspace.view() {
             Ok(v) => v,
             Err(e) => {
@@ -1115,9 +1211,7 @@ impl SimpleComponent for App {
                     std::process::exit(1);
                 }
                 println!("NATIVE_GTK_SMOKE_OK");
-                if let Some(app) = window.application() {
-                    app.quit();
-                }
+                sender.input(Msg::Shutdown);
             });
         }
     }
@@ -1470,10 +1564,17 @@ fn shlex_args(text: &str) -> anyhow::Result<Vec<String>> {
     shlex::split(text).ok_or_else(|| anyhow::anyhow!("Unclosed quote in editor arguments"))
 }
 fn main() -> anyhow::Result<()> {
-    let prefs = Preferences::load(&Preferences::path()?)?;
-    let settings = prefs.settings;
-    let app = Workspace::new(settings, None, None)?;
     let smoke = std::env::args().any(|a| a == "--smoke");
+    let cli = console_ui::config::Cli::parse_from(std::env::args().filter(|a| a != "--smoke"));
+    anyhow::ensure!(
+        cli.command.is_none(),
+        "Use the console-ui executable for headless commands"
+    );
+    let settings = console_ui::config::Settings::load(&cli)?;
+    let mut app = Workspace::new(settings, cli.record, cli.replay)?;
+    if let Some(path) = cli.policy {
+        app.dispatch(Action::LoadPolicy { path })?;
+    }
     RelmApp::new("org.consoleui.Diagnostics")
         .with_args(vec!["console-ui-gtk".into()])
         .run::<App>((app, smoke));

@@ -42,6 +42,7 @@ pub struct LiveState {
     pub notice: Option<String>,
     pub snapshot: Arc<Snapshot>,
     pub recording: Option<PathBuf>,
+    pub histogram_notice: Option<String>,
 }
 impl LiveState {
     pub fn new(target: String) -> Self {
@@ -54,6 +55,7 @@ impl LiveState {
             notice: None,
             snapshot: Arc::new(Snapshot::default()),
             recording: None,
+            histogram_notice: None,
         }
     }
 }
@@ -71,7 +73,7 @@ pub enum Command {
     Stop,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HistogramPolicy {
     pub mode: String,
@@ -79,6 +81,7 @@ pub struct HistogramPolicy {
     pub query: String,
     pub max_streams: usize,
     pub rotate_seconds: u64,
+    pub collect_without_recording: bool,
 }
 impl Default for HistogramPolicy {
     fn default() -> Self {
@@ -88,6 +91,7 @@ impl Default for HistogramPolicy {
             query: String::new(),
             max_streams: 4,
             rotate_seconds: 30,
+            collect_without_recording: false,
         }
     }
 }
@@ -202,6 +206,13 @@ impl Worker {
     pub fn send(&self, command: Command) {
         let _ = self.sender.send(command);
     }
+    pub fn shutdown(&self) {
+        let _ = self.sender.send(Command::Stop);
+        let thread = self.thread.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
     pub fn read(&self) -> LiveState {
         self.state.read().unwrap().clone()
     }
@@ -220,12 +231,7 @@ impl Worker {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        let _ = self.sender.send(Command::Stop);
-        if let Ok(slot) = self.thread.get_mut()
-            && let Some(thread) = slot.take()
-        {
-            let _ = thread.join();
-        }
+        self.shutdown();
     }
 }
 
@@ -331,6 +337,42 @@ fn idle(
     true
 }
 
+fn begin_recording(
+    pending: &mut Option<PathBuf>,
+    recorder: &mut Option<Recorder>,
+    accumulator: &Accumulator,
+    target: &str,
+    policy: &HistogramPolicy,
+    shared: &RwLock<LiveState>,
+) {
+    if pending.is_none() || !accumulator.ready_to_record() {
+        return;
+    }
+    let path = pending.take().unwrap();
+    let result = (|| -> Result<Recorder> {
+        let mut writer = Recorder::create(&path)?;
+        writer.session(target)?;
+        writer.histogram_policy(
+            target,
+            policy,
+            "Recording started; histogram coverage is limited to subscribed tasks",
+        )?;
+        writer.update(&accumulator.wire_snapshot())?;
+        for detail in accumulator.wire_details() {
+            writer.details(&detail)?;
+        }
+        Ok(writer)
+    })();
+    match result {
+        Ok(writer) => {
+            *recorder = Some(writer);
+            let mut state = shared.write().unwrap();
+            state.recording = Some(path);
+            state.notice = None;
+        }
+        Err(error) => shared.write().unwrap().notice = Some(format!("Start recording: {error:#}")),
+    }
+}
 async fn run(
     mut settings: Settings,
     shared: Arc<RwLock<LiveState>>,
@@ -342,6 +384,7 @@ async fn run(
     let mut policy = HistogramPolicy::default();
     let mut requested_pause = false;
     let mut retry = 1u64;
+    let mut pending_recording = None;
     'reconnect: loop {
         if !auto_connect {
             shared.write().unwrap().status = ConnectionStatus::Disconnected;
@@ -393,11 +436,19 @@ async fn run(
                 let mut ticks = 0u64;
                 {
                     let mut state = shared.write().unwrap();
+                    if state.session > 0 && policy.mode == "selected" {
+                        policy.tasks.clear();
+                        state.notice = Some(
+                            "Selected histogram IDs were cleared for the new connection session"
+                                .into(),
+                        );
+                    }
                     state.status = ConnectionStatus::Connected;
                     state.error = None;
                     state.paused = false;
                     state.session += 1;
                     state.snapshot = Arc::new(Snapshot::default());
+                    state.histogram_notice = None;
                 }
                 if let Some(writer) = &mut recorder {
                     let result = writer.session(&target);
@@ -427,6 +478,7 @@ async fn run(
                                 }
                                 accumulator.apply(update);
                                 accumulator.prune(settings.retention().ok().flatten());
+                                begin_recording(&mut pending_recording,&mut recorder,&accumulator,&target,&policy,&shared);
                                 publish(&accumulator, &settings, &shared);
                             }
                             result => {
@@ -438,7 +490,12 @@ async fn run(
                             }
                         },
                         state = states.message() => match state {
-                            Ok(Some(state)) => shared.write().unwrap().paused = state.temporality == instrument::Temporality::Paused as i32,
+                            Ok(Some(state)) => {
+                                let paused=state.temporality == instrument::Temporality::Paused as i32;
+                                let changed = paused != shared.read().unwrap().paused;
+                                if changed && let Some(writer)=&mut recorder {let result=writer.pause_boundary(&target,accumulator.now(),paused);record_result(result,&mut recorder,&shared);}
+                                shared.write().unwrap().paused=paused;
+                            },
                             _ => { shared.write().unwrap().error = Some("Target closed the state stream".into()); break; }
                         },
                         detail = details.next(), if !details.is_empty() => match detail {
@@ -458,20 +515,35 @@ async fn run(
                         },
                         _=refresh.tick()=>{
                             let snapshot=shared.read().unwrap().snapshot.clone();
-                            let wanted=policy.ids(&snapshot,inspected,recorder.is_some() || policy.mode != "inspected",ticks);ticks+=1;
+                            let wanted=policy.ids(&snapshot,inspected,recorder.is_some() || policy.collect_without_recording,ticks);ticks+=1;
                             for id in details.keys().copied().collect::<Vec<_>>(){if !wanted.contains(&id){details.remove(&id);}}
                             let subscribe:Vec<_>=wanted.into_iter().filter(|id|!retired.contains(id)).collect();
+                            let mut opened=0;
                             for id in subscribe{
                                 if details.contains_key(&id){continue;}
+                                if opened>=4 {break;}
+                                opened+=1;
                                 match tokio::time::timeout(Duration::from_millis(300),client.watch_task_details(instrument::TaskDetailsRequest{id:Some(Id{id})})).await{
                                     Ok(Ok(response))=>{details.insert(id,response.into_inner());},
                                     error=>{retired.insert(id);if Some(id)==inspected{shared.write().unwrap().notice=Some(format!("Task details unavailable: {error:?}"));}},
                                 }
                             }
+                            let eligibility=crate::query::Query::parse(&policy.query).unwrap_or_default();
+                            let eligible = match policy.mode.as_str() {
+                                "selected"=>policy.tasks.len(),
+                                "matching"=>snapshot.tasks.iter().filter(|t| t.state!=crate::model::TaskState::Completed && eligibility.task(t)).count(),
+                                _=>usize::from(inspected.is_some()),
+                            };
+                            let note=format!("{} active detail streams; {} eligible tasks; {} omitted by limits/rotation or unavailable; {} expired/unsupported IDs. Missing histograms are unknown.",details.len(),eligible,eligible.saturating_sub(details.len()),retired.len());
+                            shared.write().unwrap().histogram_notice=Some(note.clone());
+                            if let Some(writer)=&mut recorder {
+                                let result=writer.histogram_policy(&target,&policy,&note);
+                                record_result(result,&mut recorder,&shared);
+                            }
                         },
                         command = commands.recv() => match command {
-                            Some(Command::Connect(next)) => { target = next; requested_pause = false; continue 'reconnect; }
-                            Some(Command::Disconnect)=>{auto_connect=false;requested_pause=false;continue 'reconnect;}
+                            Some(Command::Connect(next)) => { pending_recording=None;target = next; requested_pause = false; continue 'reconnect; }
+                            Some(Command::Disconnect)=>{pending_recording=None;auto_connect=false;requested_pause=false;continue 'reconnect;}
                             Some(Command::Pause(paused)) => {
                                 let result = tokio::time::timeout(Duration::from_secs(3), async {
                                     if paused { client.pause(instrument::PauseRequest {}).await.map(|_| ()) }
@@ -479,6 +551,8 @@ async fn run(
                                 }).await;
                                 match result {
                                     Ok(Ok(())) => {
+                                        let changed = paused != shared.read().unwrap().paused;
+                                        if changed && let Some(writer)=&mut recorder {let result=writer.pause_boundary(&target,accumulator.now(),paused);record_result(result,&mut recorder,&shared);}
                                         requested_pause = paused;
                                         shared.write().unwrap().paused = paused;
                                     }
@@ -486,10 +560,12 @@ async fn run(
                                 }
                             }
                             Some(Command::Inspect(id)) => {
+                                if policy.mode=="inspected" {details.clear();}
                                 inspected=id;
                                 shared.write().unwrap().notice = None;
                                 if let Some(id) = id {
                                     retired.remove(&id);
+                                    if !details.contains_key(&id) && details.len()>=policy.max_streams {let old=details.keys().copied().next();if let Some(old)=old{details.remove(&old);}}
                                     match tokio::time::timeout(Duration::from_secs(3), client.watch_task_details(
                                         instrument::TaskDetailsRequest { id: Some(Id { id }) })).await {
                                         Ok(Ok(response)) => {details.insert(id,response.into_inner());},
@@ -506,11 +582,12 @@ async fn run(
                             },
                             Some(Command::HistogramPolicy(next))=>{if next.validate().is_ok(){policy=next;retired.clear();}},
                             Some(Command::StartRecording(path))=>{
-                                if recorder.is_some(){shared.write().unwrap().notice=Some("A recording is already active".into());continue;}
-                                let result=(||->Result<Recorder>{let mut writer=Recorder::create(&path)?;writer.session(&target)?;writer.update(&accumulator.wire_snapshot())?;for detail in accumulator.wire_details(){writer.details(&detail)?;}Ok(writer)})();
-                                match result{Ok(writer)=>{recorder=Some(writer);shared.write().unwrap().recording=Some(path);},Err(error)=>shared.write().unwrap().notice=Some(format!("Start recording: {error:#}"))}
+                                if recorder.is_some() || pending_recording.is_some(){shared.write().unwrap().notice=Some("A recording is already active or starting".into());continue;}
+                                pending_recording=Some(path);
+                                shared.write().unwrap().notice=Some("Waiting for the next telemetry boundary to seed recording and histograms".into());
+                                begin_recording(&mut pending_recording,&mut recorder,&accumulator,&target,&policy,&shared);
                             },
-                            Some(Command::StopRecording)=>{idle(Command::StopRecording,&mut target,&mut settings,&mut policy,&mut recorder,&shared,&mut auto_connect);},
+                            Some(Command::StopRecording)=>{pending_recording=None;idle(Command::StopRecording,&mut target,&mut settings,&mut policy,&mut recorder,&shared,&mut auto_connect);for id in details.keys().copied().collect::<Vec<_>>(){if Some(id)!=inspected{details.remove(&id);}}},
                             Some(Command::Stop) | None => {if let Some(writer)=&mut recorder{let _=writer.flush();}return;},
                         }
                     }

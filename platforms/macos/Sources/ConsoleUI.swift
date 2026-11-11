@@ -21,7 +21,8 @@ struct Profile: Decodable, Identifiable { let name, target: String; var id: Stri
 struct Preset: Decodable, Identifiable { let name, expression: String; var id: String { name } }
 struct EditorMapping: Decodable { let remoteRoot, localRoot: String }
 struct EditorPreferences: Decodable { let program: String; let arguments:[String]; let mappings:[EditorMapping] }
-struct Preferences: Decodable { let editor:EditorPreferences; let profiles: [Profile]; let recentTargets: [String]; let filterPresets: [Preset] }
+struct Settings: Decodable {let palette:String;let warnings:[String]}
+struct Preferences: Decodable { let settings:Settings; let editor:EditorPreferences; let profiles: [Profile]; let recentTargets: [String]; let filterPresets: [Preset] }
 struct Trend: Decodable, Identifiable { let now, busyNs, scheduledNs: UInt64; let pollsPerSecond: Double; let gap: Bool; var id: UInt64 { now } }
 struct Evidence: Decodable, Identifiable { let task: UInt64; let lint, measured, threshold, explanation, source: String; var id: String { "\(task):\(lint)" } }
 struct GraphNode: Decodable, Identifiable { let key, label, kind: String; var id: String { key } }
@@ -30,7 +31,8 @@ struct Graph: Decodable { let nodes: [GraphNode]; let edges: [GraphEdge]; let tr
 struct ComparisonRow: Decodable, Identifiable { let kind:String; let key, name, status: String; let baseline, current: UInt64?; let busyPerSecond, scheduledPerSecond, pollsPerSecond: [Double]; let regression: Bool; var id: String { key } }
 struct Comparison: Decodable { let rows: [ComparisonRow]; let notes: [String] }
 struct ExportPreview: Decodable { let target:String?; let snapshot:Snapshot; let sections:[String] }
-struct RuntimeView: Decodable { let inspection:Snapshot; let lookupTasks:[TaskRow]; let exportPreview:ExportPreview?; let reportSections, projectPresets:[String]; let name: String; let active: UInt64; let tabs: [TargetTab]; let status: String; let paused: Bool; let target: String; let recording: String?; let session: UInt64; let snapshot: Snapshot; let query: String; let selection: Selection?; let trends: [Trend]; let evidence: [Evidence]; let graph: Graph; let sessions: [SessionInfo]; let cursor: UInt64?; let playing: Bool; let speed: Double; let bookmarks: [Bookmark]; let views: [SavedView]; let preferences: Preferences; let comparison: Comparison?; let notice: String?; let pending: Int }
+struct HistogramPolicy: Decodable { let mode,query:String; let tasks:[UInt64];let maxStreams:Int;let rotateSeconds:UInt64 }
+struct RuntimeView: Decodable { let histogramPolicy:HistogramPolicy;let histogramNotice:String?; let inspection:Snapshot; let lookupTasks:[TaskRow]; let exportPreview:ExportPreview?; let reportSections, projectPresets:[String]; let name: String; let active: UInt64; let tabs: [TargetTab]; let status: String; let paused: Bool; let target: String; let recording: String?; let session: UInt64; let snapshot: Snapshot; let query: String; let selection: Selection?; let trends: [Trend]; let evidence: [Evidence]; let graph: Graph; let sessions: [SessionInfo]; let cursor: UInt64?; let playing: Bool; let speed: Double; let bookmarks: [Bookmark]; let views: [SavedView]; let preferences: Preferences; let comparison: Comparison?; let notice: String?; let pending: Int }
 
 @MainActor final class RuntimeModel: ObservableObject {
     @Published var state: RuntimeView?
@@ -148,6 +150,7 @@ struct ContentView: View {
         } detail: {
             Inspector(model: model).frame(minWidth: 320, idealWidth: 400)
         }
+        .preferredColorScheme(model.state?.preferences.settings.palette == "dark" ? .dark : model.state?.preferences.settings.palette == "light" ? .light : nil)
         .onChange(of: model.state?.active) { _, _ in endpoint = model.state?.target ?? endpoint; query = model.state?.query ?? "" }
         .onChange(of: model.state?.target) { _, value in endpoint=value ?? endpoint }
         .onChange(of: model.state?.query) { _, value in query = value ?? "" }
@@ -202,7 +205,7 @@ struct Inspector: View {
                 ForEach(t.warnings, id: \.self) { Text("Warning: \($0)").foregroundStyle(.orange) }
                 GroupBox("Task timing") { VStack(alignment: .leading) { metric("Total", ns(t.timing.total)); metric("Busy", "\(ns(t.timing.busy)) (\(percent(t.timing.busy,t.timing.total))%)"); metric("Scheduled", "\(ns(t.timing.scheduled)) (\(percent(t.timing.scheduled,t.timing.total))%)"); metric("Idle", ns(t.timing.idle)); metric("Polls", String(t.timing.polls)) } }
                 GroupBox("Waker activity") { VStack(alignment: .leading) { metric("Active", String(t.wakerClones >= t.wakerDrops ? t.wakerClones-t.wakerDrops : 0)); metric("Clones / drops", "\(t.wakerClones) / \(t.wakerDrops)"); metric("Self wakes", "\(t.selfWakes) (\(percent(t.selfWakes,t.wakes))%)"); metric("Last woken", t.lastWakeAgo.map { ns($0) + " ago" } ?? "Never") } }
-                if let details = state.inspection.details[String(t.id)] { HistogramPanel(name: "Poll times", histogram: details.poll); HistogramPanel(name: "Scheduled times", histogram: details.scheduled) } else { ProgressView("Waiting for task details…") }
+                if let details = state.inspection.details[String(t.id)] { HistogramPanel(name: "Poll times", histogram: details.poll); HistogramPanel(name: "Scheduled times", histogram: details.scheduled) } else { if state.status == "Offline" {Text("Histograms were not captured at this position. Missing samples are unknown.")} else {ProgressView("Waiting for task details…")} }
                 Text(t.location).textSelection(.enabled); Text(t.fields).font(.system(.caption, design: .monospaced)).textSelection(.enabled); Button("Open source in editor") { model.send("open_source") }
             } else if selected.kind == "resource", let r = state.inspection.resources.first(where: { $0.id == selected.id }) {
                 Text("\(r.concreteType) / resource \(r.id)").font(.title2); Text("\(r.kind) · \(r.internal ? "INT" : "PUB") · \(ns(r.total))"); Text(r.location).textSelection(.enabled); Text(r.attributes).textSelection(.enabled)
@@ -228,6 +231,7 @@ struct AnalysisPanel: View {
     @State private var future = "1024"
     var body: some View { ScrollView { VStack(alignment: .leading, spacing: 16) {
         Text("Runtime analysis").font(.title)
+        ForEach(["self-wakes","lost-waker","never-yielded","large-future","auto-boxed-future"],id:\.self) {lint in Toggle(lint,isOn:Binding(get:{model.state?.preferences.settings.warnings.contains(lint) ?? true},set:{model.send("lint_enabled",["lint":lint,"enabled":$0])}))}
         HStack { TextField("Window seconds", text: $seconds); Button("Apply window") { if let s = UInt64(seconds), s > 0, s <= UInt64.max/1_000_000_000 { model.send("window", ["nanoseconds": s*1_000_000_000]) } else { model.error = "Enter a positive number of seconds" } } }
         if let state = model.state {
             ForEach(["busy","scheduled","polls"],id:\.self) { metric in TrendChart(points:state.trends,metric:metric) }
@@ -243,26 +247,80 @@ struct AnalysisPanel: View {
 }
 struct RecordingPanel: View {
     @ObservedObject var model: RuntimeModel
-    @State private var offset = 0.0
-    @State private var dragging = false
-    @State private var bookmarkName = ""
-    @State private var note = ""
-    var body: some View { ScrollView { VStack(alignment: .leading, spacing: 16) {
-        Text("Recording and replay").font(.title)
-        HStack { Button("Start recording…") { model.chooseFile(save: true) { model.send("start_recording", ["path": $0]) } }; Button("Stop recording") { model.send("stop_recording") }; Button("Open recording…") { model.chooseFile { model.send("open_recording", ["path": $0, "recover": false]) } }; Button("Recover partial capture…") { model.chooseFile { model.send("open_recording", ["path": $0, "recover": true]) } } }
-        if let state = model.state, !state.sessions.isEmpty {
-            Picker("Session", selection: Binding(get:{max(0,Int(state.session)-1)},set:{model.send("session",["index":$0])})) { ForEach(state.sessions) { session in Text("Session \(session.index): \(session.start)–\(session.end) ns\(session.incomplete ? " (incomplete)" : "")").tag(session.index) } }
-            if let session = state.sessions.first(where: { $0.index == max(0,Int(state.session)-1) }) {
-                Slider(value: $offset, in: 0...max(0.001,Double(session.end-session.start)/1e9), onEditingChanged: { editing in dragging = editing; if !editing { model.send("seek", ["cursor": session.start + UInt64(offset*1e9)]) } })
-                Text("Cursor \(state.cursor ?? session.start) ns · offset \(offset, specifier: "%.3f")s")
-                HStack { Button(state.playing ? "Pause playback" : "Play recording") { model.send("playback") }; ForEach([0.5,1.0,2.0,4.0], id: \.self) { speed in Button("\(speed, specifier: "%.1f")×") { model.send("speed", ["speed": speed]) } } }
-                .onAppear { if let cursor=state.cursor, cursor >= session.start {offset=Double(cursor-session.start)/1e9} }
-                .onChange(of: state.cursor) { _, cursor in if !dragging, let cursor, cursor >= session.start { offset = Double(cursor-session.start)/1e9 } }
+    var body: some View {
+        ScrollView { VStack(alignment:.leading,spacing:16) {
+            Text("Recording and replay").font(.title)
+            HStack {
+                Button("Start recording…") { model.chooseFile(save:true) { model.send("start_recording",["path":$0]) } }
+                Button("Stop recording") {model.send("stop_recording")}
+                Button("Open recording…") {model.chooseFile {model.send("open_recording",["path":$0,"recover":false])}}
+                Button("Recover partial capture…") {model.chooseFile {model.send("open_recording",["path":$0,"recover":true])}}
             }
-            HStack { TextField("Bookmark name", text: $bookmarkName); TextField("Investigation note", text: $note); Button("Bookmark cursor") { model.send("bookmark", ["name": bookmarkName, "note": note]) } }
-            ForEach(state.bookmarks) { bookmark in HStack { Text("\(bookmark.name) · \(bookmark.cursor) ns · \(bookmark.note)"); Button("Go") { model.send("go_bookmark", ["id": bookmark.id]); selectedSession = bookmark.session }; Button("Delete") { model.send("delete_bookmark", ["id": bookmark.id]) } } }
+            if let state=model.state, !state.sessions.isEmpty {
+                ReplayControls(model:model,state:state)
+                BookmarkControls(model:model)
+            }
+            HistogramControls(model:model)
+        }.padding() }
+    }
+}
+struct ReplayControls: View {
+    @ObservedObject var model:RuntimeModel
+    let state:RuntimeView
+    @State private var offset=0.0
+    @State private var dragging=false
+    private var session:SessionInfo? {state.sessions.first {$0.index == max(0,Int(state.session)-1)}}
+    private var index:Binding<Int> {Binding(get:{max(0,Int(state.session)-1)},set:{model.send("session",["index":$0])})}
+    var body:some View {VStack(alignment:.leading,spacing:12) {
+        Picker("Session",selection:index) {ForEach(state.sessions) {s in Text("Session \(s.index) · \(s.incomplete ? "incomplete" : "complete")").tag(s.index)}}
+        if let session {
+            Slider(value:$offset,in:0...max(0.001,Double(session.end-session.start)/1e9),onEditingChanged:{editing in dragging=editing;if !editing {model.send("seek",["cursor":session.start+UInt64(offset*1e9)])}})
+            Text("Cursor \(state.cursor ?? session.start) ns · offset \(offset,specifier:"%.3f")s")
+            Button(state.playing ? "Pause playback" : "Play recording") {model.send("playback")}
+            HStack {ForEach([0.5,1.0,2.0,4.0],id:\.self) {speed in Button("\(speed,specifier:"%.1f")×") {model.send("speed",["speed":speed])}}}
         }
-    }.padding() } }
+    }.onAppear {syncOffset()}.onChange(of:state.cursor) {_,_ in syncOffset()}}
+    private func syncOffset() {if !dragging,let session,let cursor=state.cursor,cursor>=session.start {offset=Double(cursor-session.start)/1e9}}
+}
+struct BookmarkControls:View {
+    @ObservedObject var model:RuntimeModel
+    @State private var name=""
+    @State private var note=""
+    @State private var editing:UInt64?
+    var body:some View {VStack(alignment:.leading,spacing:12) {
+        TextField("Bookmark name",text:$name);TextField("Investigation note",text:$note)
+        HStack {
+            Button(editing == nil ? "Bookmark cursor" : "Save bookmark changes") {if let editing {model.send("edit_bookmark",["id":editing,"name":name,"note":note])} else {model.send("bookmark",["name":name,"note":note])}}
+            Button("New bookmark") {editing=nil;name="";note=""}
+        }
+        ForEach(model.state?.bookmarks ?? []) {b in HStack {
+            Text("\(b.name) · \(b.cursor) ns · \(b.note)")
+            Button("Go") {model.send("go_bookmark",["id":b.id])}
+            Button("Edit") {editing=b.id;name=b.name;note=b.note}
+            Button("Delete") {model.send("delete_bookmark",["id":b.id])}
+        }}
+    }}
+}
+struct HistogramControls:View {
+    @ObservedObject var model:RuntimeModel
+    @State private var mode="inspected"
+    @State private var ids=""
+    @State private var query=""
+    @State private var limit="4"
+    @State private var rotation="30"
+    var body:some View {GroupBox("Histogram capture policy") {VStack(alignment:.leading,spacing:12) {
+        Picker("Mode",selection:$mode) {Text("Inspected task").tag("inspected");Text("Selected IDs").tag("selected");Text("Matching tasks").tag("matching")}
+        TextField("Task IDs, comma separated",text:$ids);TextField("Matching task filter",text:$query)
+        HStack {TextField("Maximum streams (1–32)",text:$limit);TextField("Rotation seconds",text:$rotation)}
+        Button("Save capture policy") {apply()}
+        Text(model.state?.histogramNotice ?? "Additional subscriptions run during recording. Missing histograms are unknown.").font(.caption)
+    }}.onAppear {if let p=model.state?.histogramPolicy {mode=p.mode;ids=p.tasks.map(String.init).joined(separator:",");query=p.query;limit=String(p.maxStreams);rotation=String(p.rotateSeconds)}}}
+    private func apply() {
+        let values=ids.split(separator:",").map {$0.trimmingCharacters(in:.whitespaces)}
+        let tasks=values.compactMap(UInt64.init)
+        guard tasks.count==values.count,let maximum=Int(limit),(1...32).contains(maximum),let seconds=UInt64(rotation),seconds>0 else {model.error="Enter valid task IDs, stream limit, and rotation";return}
+        model.send("histogram_policy",["policy":["mode":mode,"tasks":tasks,"query":query,"max_streams":maximum,"rotate_seconds":seconds]])
+    }
 }
 struct ComparePanel: View {
     @ObservedObject var model: RuntimeModel
@@ -312,17 +370,20 @@ struct WorkspacePanel: View {
     @ObservedObject var model: RuntimeModel
     @State private var name = "My investigation"
     @State private var preset = ""
+    @State private var originalView = ""
     @State private var editor = "code"
     @State private var arguments = "--goto '{file}:{line}:{column}'"
     @State private var remote = ""
     @State private var local = ""
     var body: some View { Form {
+        Picker("Appearance",selection:Binding(get:{model.state?.preferences.settings.palette ?? "system"},set:{model.send("appearance",["palette":$0])})) {Text("System").tag("system");Text("Light").tag("light");Text("Dark").tag("dark")}
         Text("Workspace").font(.title); TextField("Workspace / investigation name", text: $name)
         HStack { Button("New workspace") { model.send("new_workspace", ["name": name]) }; Button("Save workspace…") { model.chooseFile(save: true, extensions: ["json"]) { model.send("save_workspace", ["path": $0, "name": name]) } }; Button("Open workspace…") { model.chooseFile(extensions: ["json"]) { model.send("open_workspace", ["path": $0]) } } }
         Button("Save current investigation view") { model.send("save_view", ["name": name]) }
+        TextField("Existing view name",text:$originalView);HStack {Button("Rename view"){model.send("rename_view",["name":originalView,"new_name":name])};Button("Duplicate view"){model.send("duplicate_view",["name":originalView,"new_name":name])}}
         if let s = model.state { ForEach(s.views) { view in HStack { Text(view.name); Button("Restore") { model.send("load_view", ["name": view.name]) }; Button("Delete") { model.send("delete_view", ["name": view.name]) } } } }
         TextField("Filter preset name", text: $preset); Button("Save global filter preset") { model.send("save_preset", ["name": preset]) }; Button("Save project filter preset") {model.send("save_project_preset",["name":preset])}
-        if let s = model.state { ForEach(s.preferences.filterPresets) { p in HStack { Text("\(p.name): \(p.expression)"); Button("Apply") { model.send("apply_preset", ["name": p.name]) }; Button("Delete") { model.send(s.projectPresets.contains(p.name) ? "delete_project_preset" : "delete_preset", ["name": p.name]) } } } }
+        if let s = model.state { ForEach(s.preferences.filterPresets) { p in HStack { Text("\(p.name): \(p.expression)"); Button("Apply") { model.send("apply_preset", ["name": p.name]) }; Button("Rename to entered preset name") {model.send("rename_preset",["name":p.name,"new_name":preset,"project":s.projectPresets.contains(p.name)])}; Button("Delete") { model.send(s.projectPresets.contains(p.name) ? "delete_project_preset" : "delete_preset", ["name": p.name]) } } } }
         HStack { Button("Import project policy…") { model.chooseFile(extensions: ["json"]) { model.send("load_policy", ["path": $0]) } }; Button("Export project policy…") { model.chooseFile(save: true, extensions: ["json"]) { model.send("save_policy", ["path": $0]) } } }
         Text("Source editor").font(.headline); TextField("Executable", text: $editor); TextField("Arguments", text: $arguments); TextField("Remote source root", text: $remote); TextField("Local source root", text: $local)
         Button("Save source-editor integration") { guard let args = splitArguments(arguments) else {model.error="Unclosed quote in editor arguments";return}; var mappings: [[String: String]] = []; if !remote.isEmpty { mappings.append(["remote_root": remote,"local_root": local]) }; model.send("editor", ["preferences": ["program": editor,"arguments": args,"mappings": mappings]]) }
@@ -354,11 +415,11 @@ func percent(_ value: UInt64, _ total: UInt64) -> String { String(format:"%.1f",
 func durationNs(_ value: String) -> UInt64? { for (suffix, factor) in [("ms",1e6),("us",1e3),("ns",1.0),("s",1e9),("min",60e9)] { if value.hasSuffix(suffix), let number = Double(value.dropLast(suffix.count)), number.isFinite, number > 0, number*factor < Double(UInt64.max) { return UInt64(number*factor) } }; return nil }
 func splitArguments(_ value: String) -> [String]? { var args:[String] = []; var current = ""; var quote: Character?; for c in value { if c == "'" || c == "\"" { if quote == c { quote = nil } else if quote == nil { quote = c } else { current.append(c) } } else if c.isWhitespace && quote == nil { if !current.isEmpty { args.append(current); current = "" } } else { current.append(c) } }; if quote != nil {return nil}; if !current.isEmpty { args.append(current) }; return args }
 
-final class AppDelegate: NSObject, NSApplicationDelegate { func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true } }
+@MainActor final class AppDelegate: NSObject, NSApplicationDelegate { weak var model:RuntimeModel?; func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {true};func applicationWillTerminate(_ notification:Notification) {model?.shutdown()} }
 @main struct ConsoleUIApplication: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var model = RuntimeModel()
-    var body: some Scene { WindowGroup("Console UI") { ContentView(model: model).frame(minWidth: 1100,minHeight: 700) }.defaultSize(width: 1540,height: 960).commands {
+    var body: some Scene { WindowGroup("Console UI") { ContentView(model: model).frame(minWidth: 1100,minHeight: 700).onAppear {delegate.model=model} }.defaultSize(width: 1540,height: 960).commands {
         SidebarCommands()
         CommandMenu("Diagnostics") { Button("Find task…") { model.lookup = true }.keyboardShortcut("k",modifiers:.command); Button("Pause / resume target") { model.send("pause") }.keyboardShortcut("p",modifiers:[.command,.shift]); Button("Open recording…") { model.chooseFile { model.send("open_recording",["path":$0,"recover":false]) } }.keyboardShortcut("o",modifiers:.command); Button("Open selected source") { model.send("open_source") }.keyboardShortcut("j",modifiers:[.command,.shift]) }
     } }

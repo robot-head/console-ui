@@ -25,6 +25,13 @@ function Invoke-Name([string]$Name) {
     $pattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
     $pattern.Invoke()
 }
+function Set-Text([string]$Name, [string]$Value) {
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $Name),
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit))
+    $element = Wait-For { $script:root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition) } $Name
+    $element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Value)
+}
 function Capture([string]$Name) {
     $bounds = $script:root.Current.BoundingRectangle
     $bitmap = [System.Drawing.Bitmap]::new([int]$bounds.Width, [int]$bounds.Height)
@@ -36,7 +43,8 @@ function Capture([string]$Name) {
 }
 try {
     $demo = Start-Process "$PSScriptRoot/../target/debug/examples/instrumented.exe" -PassThru
-    $app = Start-Process (Resolve-Path $Executable) -PassThru
+    $capture = "$PSScriptRoot/../dist/smoke-native-recording.tcui"
+    $app = Start-Process (Resolve-Path $Executable) -ArgumentList @('--record', $capture) -PassThru
     $script:root = Wait-For {
         $app.Refresh()
         if ($app.HasExited) { throw "App exited with $($app.ExitCode)" }
@@ -65,7 +73,27 @@ try {
     Wait-For { Find-Name 'PAUSED' } 'paused state' | Out-Null
     Invoke-Name 'Resume'
     Wait-For { Find-Name 'CONNECTED' } 'resumed state' | Out-Null
-    Write-Output 'Packaged app connected, inspected tasks/resources, and paused/resumed successfully.'
+    Invoke-Name 'Filters & lookup'
+    Set-Text 'Filter expression' 'name:worker-0'
+    Invoke-Name 'Apply filter'
+    Invoke-Name 'Monitor'
+    Invoke-Name 'Tasks'
+    $table = Wait-For { Find-Name 'Live telemetry table' } 'filtered task table'
+    Wait-For { $table.FindAll([System.Windows.Automation.TreeScope]::Descendants, $itemCondition).Count -eq 1 } 'one filtered worker task' | Out-Null
+    Capture 'filtered-task'
+    Invoke-Name 'Analysis'
+    Invoke-Name 'Apply time window'
+    Wait-For { Find-Name 'Warning thresholds' } 'analysis controls'
+    Capture 'analysis'
+    $script:root.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close()
+    if (-not $app.WaitForExit(10000)) { throw 'Native window did not shut down cleanly' }
+    if ($app.ExitCode -ne 0) { throw "Native shutdown failed with $($app.ExitCode)" }
+    $replay = "$PSScriptRoot/../dist/smoke-native-replay.json"
+    & $Executable --replay $capture dump --output $replay
+    if ($LASTEXITCODE -ne 0) { throw 'Shutdown recording could not be replayed' }
+    $snapshot = Get-Content $replay -Raw | ConvertFrom-Json
+    if ($snapshot.tasks.Count -lt 1) { throw 'Shutdown recording lost its task data' }
+    Write-Output 'Packaged app inspected tasks/resources, filtered a task, rendered analysis, paused/resumed, and flushed a replayable capture on native window close.'
 } finally {
     if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id -Force }
     if ($demo -and -not $demo.HasExited) { Stop-Process -Id $demo.Id -Force }

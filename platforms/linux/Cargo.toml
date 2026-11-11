@@ -13,4 +13,5 @@ anyhow = "1"
 serde_json = "1"
 humantime = "2"
 shlex = "1"
+clap = "4.5"
 

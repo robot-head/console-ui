@@ -3,11 +3,12 @@ set -euo pipefail
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
 export MACOSX_DEPLOYMENT_TARGET=14.0
-cargo build --locked --release --lib
+cargo build --locked --release --lib --bin console-ui
 app_root="$project_root/dist/Console UI.app"
 rm -rf -- "$app_root"
 mkdir -p "$app_root/Contents/MacOS" "$app_root/Contents/Frameworks" "$app_root/Contents/Resources"
 cp platforms/macos/Info.plist "$app_root/Contents/Info.plist"
+cp target/release/console-ui "$app_root/Contents/MacOS/console-ui"
 cp target/release/libconsole_ui.dylib "$app_root/Contents/Frameworks/"
 install_name_tool -id '@rpath/libconsole_ui.dylib' "$app_root/Contents/Frameworks/libconsole_ui.dylib"
 xcrun swiftc -swift-version 5 -O -parse-as-library \

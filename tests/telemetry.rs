@@ -10,6 +10,7 @@ use console_ui::{
     config::Settings,
     telemetry::{Command, ConnectionStatus, LiveState, Worker},
 };
+use hdrhistogram::serialization::{Serializer, V2Serializer};
 use std::{
     pin::Pin,
     sync::{
@@ -79,9 +80,17 @@ impl Instrument for Producer {
         if id.id != 1 {
             return Err(Status::not_found("task is not retained"));
         }
+        let mut histogram = hdrhistogram::Histogram::<u64>::new(3).unwrap();
+        histogram.record(100).unwrap();
+        histogram.record(1000).unwrap();
+        let mut raw = vec![];
+        V2Serializer::new().serialize(&histogram, &mut raw).unwrap();
         Ok(Response::new(Box::pin(tokio_stream::iter([Ok(
             tasks::TaskDetails {
                 task_id: Some(id),
+                poll_times_histogram: Some(
+                    tasks::task_details::PollTimesHistogram::LegacyHistogram(raw),
+                ),
                 ..Default::default()
             },
         )]))))
@@ -160,6 +169,36 @@ async fn streams_details_pause_resume_and_reconnects_without_mixing_sessions() {
     wait(&worker, |s| s.snapshot.tasks.len() == 2).await;
     worker.send(Command::Inspect(Some(1)));
     wait(&worker, |s| s.snapshot.details.contains_key(&1)).await;
+    let directory = tempfile::tempdir().unwrap();
+    let capture = directory.path().join("started-mid-session.tcui");
+    worker.send(Command::StartRecording(capture.clone()));
+    wait(&worker, |s| s.recording.as_ref() == Some(&capture)).await;
+    worker.send(Command::StopRecording);
+    wait(&worker, |s| s.recording.is_none()).await;
+    let saved = console_ui::recording::replay(
+        &capture,
+        &Settings {
+            retain_for: "none".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        saved.tasks.len(),
+        2,
+        "Mid-session recording must seed all existing entities"
+    );
+    assert_eq!(
+        saved.details[&1].poll.count, 2,
+        "Mid-session recording must seed the exact histogram counts"
+    );
+    assert!(
+        console_ui::investigation::Recording::open(&capture)
+            .unwrap()
+            .sessions[0]
+            .histogram_policy
+            .is_some()
+    );
     worker.send(Command::Pause(true));
     wait(&worker, |s| s.paused).await;
     assert!(*producer.paused.borrow());

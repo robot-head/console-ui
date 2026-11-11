@@ -263,6 +263,12 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
+    pub fn now(&self) -> u64 {
+        self.now
+    }
+    pub fn ready_to_record(&self) -> bool {
+        self.updates > 0 && self.details.values().all(|d| d.updated_at <= self.now)
+    }
     pub fn wire_details(&self) -> Vec<tasks::TaskDetails> {
         let histogram = |d: &Distribution| tasks::DurationHistogram {
             raw_histogram: d.raw_histogram.clone(),

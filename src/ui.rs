@@ -1268,8 +1268,13 @@ fn help_view() -> View {
     ))).into()
 }
 
-pub fn run(settings: Settings, record: Option<PathBuf>, replay: Option<PathBuf>) -> Result<()> {
-    crate::windows_workbench::run(settings, record, replay)
+pub fn run(
+    settings: Settings,
+    record: Option<PathBuf>,
+    replay: Option<PathBuf>,
+    policy: Option<PathBuf>,
+) -> Result<()> {
+    crate::windows_workbench::run(settings, record, replay, policy)
 }
 pub fn show_error(error: &str) {
     let text: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();

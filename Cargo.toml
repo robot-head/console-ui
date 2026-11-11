@@ -3,7 +3,7 @@ name = "console-ui"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Native Windows 11 diagnostics for Tokio tasks and runtime resources"
+description = "Native diagnostics and investigation tools for Tokio tasks and runtime resources"
 license = "MIT"
 default-run = "console-ui"
 

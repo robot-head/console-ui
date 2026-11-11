@@ -1,0 +1,71 @@
+name: Performance checks
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_run_id:
+        description: Prior workflow run ID containing the baseline-v1 artifact (empty for initial baseline)
+        required: false
+        type: string
+      promote:
+        description: Publish a new versioned baseline only after successful checks
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  actions: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --bin console-ui --example instrumented
+      - name: Capture the instrumented observation
+        shell: bash
+        run: |
+          mkdir -p performance/current
+          target/release/examples/instrumented > performance/target.log 2>&1 &
+          workload_pid=$!
+          trap 'kill "$workload_pid" 2>/dev/null || true' EXIT
+          target/release/console-ui capture performance/current/capture.tcui --observe 10s --histogram-query 'name:worker-0' --max-streams 4
+      - uses: actions/download-artifact@v4
+        if: inputs.baseline_run_id != ''
+        with:
+          name: baseline-v1
+          path: performance/baseline
+          run-id: ${{ inputs.baseline_run_id }}
+          github-token: ${{ github.token }}
+      - name: Check budgets and the selected baseline
+        env:
+          BASELINE_RUN_ID: ${{ inputs.baseline_run_id }}
+        shell: bash
+        run: |
+          baseline_args=()
+          if [ -n "$BASELINE_RUN_ID" ]; then
+            (cd performance/baseline && sha256sum --check capture.tcui.sha256)
+            baseline_args=(--baseline performance/baseline/capture.tcui)
+          fi
+          target/release/console-ui check --rules examples/budgets.json --input performance/current/capture.tcui "${baseline_args[@]}" --output performance/results.json
+      - name: Record baseline provenance
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, platform
+          from pathlib import Path
+          Path('performance/current/manifest.json').write_text(json.dumps({'schema_version':1,'source_revision':os.environ['SOURCE_REVISION'],'platform':platform.platform(),'capture':'capture.tcui'},indent=2))
+          PY
+          (cd performance/current && sha256sum capture.tcui > capture.tcui.sha256)
+      - uses: actions/upload-artifact@v4
+        if: success() && inputs.promote
+        with:
+          name: baseline-v1
+          path: performance/current/
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-evidence
+          path: performance/
+          retention-days: 30

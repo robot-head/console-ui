@@ -43,8 +43,34 @@ fn run(cli: Cli) -> Result<()> {
         );
         return Ok(());
     }
-    let settings = Settings::load(&cli)?;
+    let settings = Settings::load(&cli).map_err(|e| {
+        if matches!(
+            &cli.command,
+            Some(Action::Check { .. } | Action::Capture { .. })
+        ) {
+            anyhow::Error::new(console_ui::automation::CliFailure {
+                code: 2,
+                message: format!("{e:#}"),
+            })
+        } else {
+            e
+        }
+    })?;
     match &cli.command {
+        Some(Action::Capture {
+            output,
+            observe,
+            timeout,
+            histogram_query,
+            max_streams,
+        }) => console_ui::automation::capture(
+            output,
+            observe,
+            timeout,
+            histogram_query,
+            *max_streams,
+            &settings,
+        ),
         Some(Action::Check { options }) => {
             let code = console_ui::automation::check(options, &settings)?;
             if code != 0 {
@@ -68,6 +94,10 @@ fn run(cli: Cli) -> Result<()> {
             current_session,
             output,
         }) => {
+            if let Some(output) = output {
+                console_ui::sharing::preserve_source(baseline, output)?;
+                console_ui::sharing::preserve_source(current, output)?;
+            }
             let (a, sa) =
                 console_ui::automation::capture_window(baseline, *baseline_session, &settings)?;
             let (b, sb) =
@@ -93,6 +123,7 @@ fn run(cli: Cli) -> Result<()> {
             redact_paths,
             redact_endpoint,
         }) => {
+            console_ui::sharing::preserve_source(input, output)?;
             let mut recording = console_ui::investigation::Recording::open(input)?;
             let info = recording
                 .sessions
@@ -157,12 +188,12 @@ fn run(cli: Cli) -> Result<()> {
         None => {
             #[cfg(windows)]
             {
-                console_ui::ui::run(settings, cli.record, cli.replay)
+                console_ui::ui::run(settings, cli.record, cli.replay, cli.policy)
             }
             #[cfg(not(windows))]
             {
                 bail!(
-                    "The native interface requires Windows 11. Use 'dump', 'gen-config', or 'gen-completion' on this platform."
+                    "Launch console-ui-gtk on Linux or Console UI.app on macOS. This executable provides capture, replay dump, check, compare, export, and configuration commands on every platform."
                 );
             }
         }

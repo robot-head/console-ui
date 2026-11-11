@@ -89,6 +89,7 @@ impl Query {
                 ensure!(
                     [
                         "name",
+                        "entity",
                         "id",
                         "state",
                         "warning",
@@ -150,6 +151,7 @@ impl Query {
         self.matches(
             |field| {
                 Some(match field {
+                    "entity" => "task".into(),
                     "name" => t.name.clone(),
                     "id" => t.id.to_string(),
                     "state" => format!("{:?}", t.state),
@@ -185,6 +187,7 @@ impl Query {
         self.matches(
             |f| {
                 Some(match f {
+                    "entity" => "resource".into(),
                     "name" | "type" => r.concrete_type.clone(),
                     "id" => r.id.to_string(),
                     "kind" => r.kind.clone(),
@@ -212,6 +215,7 @@ impl Query {
             |f| {
                 Some(match f {
                     "id" => o.id.to_string(),
+                    "entity" => "operation".into(),
                     "name" => o.task_name.clone(),
                     "source" => o.source.clone(),
                     "attributes" => o.attributes.clone(),

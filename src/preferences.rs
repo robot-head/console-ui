@@ -174,6 +174,23 @@ impl Default for EditorPreferences {
     }
 }
 impl EditorPreferences {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.program.trim().is_empty() && !self.program.contains('\0'),
+            "Configure a valid editor executable"
+        );
+        ensure!(
+            self.arguments.iter().all(|a| !a.contains('\0')),
+            "Editor arguments cannot contain NUL characters"
+        );
+        ensure!(
+            self.mappings
+                .iter()
+                .all(|m| !m.remote_root.trim().is_empty() && !m.local_root.as_os_str().is_empty()),
+            "Source mappings need nonempty remote and local roots"
+        );
+        Ok(())
+    }
     pub fn resolve(&self, location: &str) -> Result<(PathBuf, u32, u32)> {
         let mut parts = location.rsplitn(3, ':');
         let column: u32 = parts
@@ -253,6 +270,7 @@ pub struct Preferences {
     pub editor: EditorPreferences,
     pub settings: Settings,
     pub saved_views: Vec<crate::investigation::InvestigationView>,
+    pub histogram_policy: crate::telemetry::HistogramPolicy,
 }
 impl Default for Preferences {
     fn default() -> Self {
@@ -265,6 +283,7 @@ impl Default for Preferences {
             editor: EditorPreferences::default(),
             settings: Settings::default(),
             saved_views: vec![],
+            histogram_policy: Default::default(),
         }
     }
 }
@@ -276,8 +295,13 @@ impl Preferences {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let value: Self = load_json(path)?;
+        let mut value: Self = load_json(path)?;
         value.validate()?;
+        // Numeric task IDs are meaningful only inside the connection that chose
+        // them. Persist the mode/limits, but require a new selection on restart.
+        if value.histogram_policy.mode == "selected" {
+            value.histogram_policy.tasks.clear();
+        }
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
@@ -287,16 +311,31 @@ impl Preferences {
             self.schema_version
         );
         self.settings.retention()?;
+        validate_target(&self.settings.target)?;
         self.settings.lint_thresholds.validate()?;
+        self.editor.validate()?;
+        self.histogram_policy.validate()?;
+        let mut names = std::collections::BTreeSet::new();
         for profile in &self.profiles {
-            ensure!(!profile.name.trim().is_empty(), "A profile needs a name");
+            ensure!(
+                !profile.name.trim().is_empty() && names.insert(&profile.name),
+                "Profile names must be nonempty and unique"
+            );
             validate_target(&profile.target)?;
         }
+        names.clear();
         for preset in &self.filter_presets {
+            ensure!(
+                !preset.name.trim().is_empty() && names.insert(&preset.name),
+                "Preset names must be nonempty and unique"
+            );
             crate::query::Query::parse(&preset.expression)?;
         }
         for table in self.tables.values() {
             table.validate()?;
+        }
+        for view in &self.saved_views {
+            view.validate()?;
         }
         Ok(())
     }

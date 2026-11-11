@@ -44,6 +44,133 @@ fn failure(code: i32, error: impl std::fmt::Display) -> anyhow::Error {
     }
     .into()
 }
+fn cancellation() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    static CANCELLED: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    CANCELLED
+        .get_or_init(|| {
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = cancelled.clone();
+            std::thread::spawn(move || {
+                if let Ok(runtime) = tokio::runtime::Runtime::new() {
+                    runtime.block_on(async {
+                        if tokio::signal::ctrl_c().await.is_ok() {
+                            signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            cancelled
+        })
+        .clone()
+}
+pub fn capture(
+    output: &std::path::Path,
+    observe: &str,
+    timeout: &str,
+    query: &str,
+    max_streams: usize,
+    settings: &crate::config::Settings,
+) -> Result<()> {
+    let parse = |s: &str| -> Result<Duration> {
+        let duration = humantime::parse_duration(s).map_err(|e| failure(EXIT_CONFIG, e))?;
+        if duration.is_zero() {
+            return Err(failure(EXIT_CONFIG, "Durations must be positive"));
+        }
+        Ok(duration)
+    };
+    let observe = parse(observe)?;
+    let timeout = parse(timeout)?;
+    let policy = crate::telemetry::HistogramPolicy {
+        mode: "matching".into(),
+        query: query.into(),
+        max_streams,
+        collect_without_recording: true,
+        ..Default::default()
+    };
+    policy.validate().map_err(|e| failure(EXIT_CONFIG, e))?;
+    let cancelled = cancellation();
+    if output.exists() {
+        return Err(failure(
+            EXIT_CONFIG,
+            "Existing captures are never overwritten",
+        ));
+    }
+    let mut capture_settings = settings.clone();
+    capture_settings.retain_for = "none".into();
+    let worker = crate::telemetry::Worker::start(capture_settings, None, None)
+        .map_err(|e| failure(EXIT_UNAVAILABLE, e))?;
+    worker.send(crate::telemetry::Command::HistogramPolicy(policy.clone()));
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| failure(EXIT_CONFIG, "Timeout is too large"))?;
+    let start = loop {
+        let state = worker.read();
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(failure(
+                EXIT_UNAVAILABLE,
+                "Capture cancelled; complete frames were flushed",
+            ));
+        }
+        if state.snapshot.updates > 0
+            && policy
+                .ids(&state.snapshot, None, true, 0)
+                .iter()
+                .all(|id| state.snapshot.details.contains_key(id))
+        {
+            break state;
+        }
+        if Instant::now() >= deadline {
+            return Err(failure(
+                EXIT_UNAVAILABLE,
+                state
+                    .error
+                    .unwrap_or("Timed out waiting for telemetry".into()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    worker.send(crate::telemetry::Command::StartRecording(output.to_owned()));
+    while worker.read().recording.as_deref() != Some(output) {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(failure(
+                EXIT_UNAVAILABLE,
+                worker
+                    .read()
+                    .notice
+                    .unwrap_or("Timed out starting recording".into()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let end = Instant::now()
+        .checked_add(observe)
+        .ok_or_else(|| failure(EXIT_CONFIG, "Observation is too large"))?;
+    while Instant::now() < end {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(failure(
+                EXIT_UNAVAILABLE,
+                "Capture cancelled; complete frames were flushed",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let state = worker.read();
+    if state.session != start.session
+        || state.snapshot.now <= start.snapshot.now
+        || state.status != crate::telemetry::ConnectionStatus::Connected
+        || state.recording.as_deref() != Some(output)
+        || state.snapshot.dropped_events > start.snapshot.dropped_events
+    {
+        return Err(failure(
+            EXIT_UNAVAILABLE,
+            "Capture did not contain an uninterrupted observation interval",
+        ));
+    }
+    drop(worker); // Joins the worker and synchronizes the recording before returning.
+    eprintln!("Saved {}", output.display());
+    Ok(())
+}
 
 pub fn capture_window(
     path: &std::path::Path,
@@ -79,6 +206,13 @@ pub fn capture_range(
     ))
 }
 pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Result<i32> {
+    if let Some(output) = &options.output {
+        for source in options.input.iter().chain(options.baseline.iter()) {
+            crate::sharing::preserve_source(source, output).map_err(|e| failure(EXIT_CONFIG, e))?;
+        }
+        crate::sharing::preserve_source(&options.rules, output)
+            .map_err(|e| failure(EXIT_CONFIG, e))?;
+    }
     let rules: Rules =
         crate::preferences::load_json(&options.rules).map_err(|e| failure(EXIT_CONFIG, e))?;
     rules.validate().map_err(|e| failure(EXIT_CONFIG, e))?;
@@ -100,25 +234,43 @@ pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Resu
         if timeout.is_zero() {
             return Err(failure(EXIT_CONFIG, "Telemetry timeout must be positive"));
         }
-        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let signal = cancelled.clone();
-        std::thread::spawn(move || {
-            if let Ok(runtime) = tokio::runtime::Runtime::new() {
-                runtime.block_on(async {
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        signal.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                });
-            }
-        });
+        let cancelled = cancellation();
         let mut live_settings = settings.clone();
         live_settings.retain_for = "none".into();
         let worker = crate::telemetry::Worker::start(live_settings, None, None)
             .map_err(|e| failure(EXIT_UNAVAILABLE, e))?;
+        let histogram_rules: Vec<_> = rules
+            .rules
+            .iter()
+            .filter(|r| r.metric.ends_with("p99_ns"))
+            .map(|r| Query::parse(&r.query))
+            .collect::<Result<_>>()?;
+        let histogram_query = if rules
+            .rules
+            .iter()
+            .any(|r| r.metric.ends_with("p99_ns") && r.query.trim().is_empty())
+        {
+            String::new()
+        } else {
+            rules
+                .rules
+                .iter()
+                .filter(|r| r.metric.ends_with("p99_ns"))
+                .map(|r| r.query.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
         worker.send(crate::telemetry::Command::HistogramPolicy(
             crate::telemetry::HistogramPolicy {
-                mode: "matching".into(),
+                mode: if histogram_rules.is_empty() {
+                    "inspected"
+                } else {
+                    "matching"
+                }
+                .into(),
+                query: histogram_query,
                 max_streams: 32,
+                collect_without_recording: true,
                 ..Default::default()
             },
         ));
@@ -130,16 +282,15 @@ pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Resu
                 return Err(failure(EXIT_UNAVAILABLE, "Observation cancelled"));
             }
             let s = worker.read();
-            if s.snapshot.updates > 0 {
-                let need_histograms = rules.rules.iter().any(|r| r.metric.ends_with("p99_ns"));
-                if !need_histograms
+            if s.snapshot.updates > 0
+                && (histogram_rules.is_empty()
                     || s.snapshot
                         .tasks
                         .iter()
-                        .all(|t| s.snapshot.details.contains_key(&t.id))
-                {
-                    break s;
-                }
+                        .filter(|t| histogram_rules.iter().any(|q| q.task(t)))
+                        .all(|t| s.snapshot.details.contains_key(&t.id)))
+            {
+                break s;
             }
             if Instant::now() >= deadline {
                 return Err(failure(
@@ -171,21 +322,48 @@ pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Resu
         )
     };
     let mut report = rules.evaluate(&snapshot, incomplete)?;
+    report.observation_seconds = Some(seconds);
+    report.session = Some(options.session);
     if let Some(path) = &options.baseline {
         let (base, base_seconds) = capture_window(path, options.baseline_session, settings)
             .map_err(|e| failure(EXIT_UNAVAILABLE, e))?;
         let comparison = crate::analysis::compare(
-            &base,
-            &snapshot,
+            &Query::parse(&rules.comparison_query)?.filter(&base),
+            &Query::parse(&rules.comparison_query)?.filter(&snapshot),
             [base_seconds, seconds],
             &rules.comparison_policy,
         )
         .map_err(|e| failure(EXIT_UNAVAILABLE, e))?;
         report = report.with_comparison(comparison);
     }
+    if report.exit_code == EXIT_UNAVAILABLE {
+        report.exit_code = rules.unavailable_exit_code;
+    }
+    for result in &report.results {
+        eprintln!(
+            "{}: {} · {:?} {} (maximum {}) · {} matching tasks",
+            result.status,
+            result.name,
+            result.measured,
+            result.unit,
+            result.maximum,
+            result.matched_tasks
+        );
+    }
+    if let Some(comparison) = &report.comparison {
+        eprintln!(
+            "{} regressions; {} ambiguous identities",
+            comparison.rows.iter().filter(|r| r.regression).count(),
+            comparison
+                .rows
+                .iter()
+                .filter(|r| r.status == "ambiguous")
+                .count()
+        );
+    }
     let bytes = serde_json::to_vec_pretty(&report)?;
     if let Some(path) = &options.output {
-        crate::preferences::atomic_write(path, &bytes)?;
+        crate::preferences::atomic_write(path, &bytes).map_err(|e| failure(EXIT_CONFIG, e))?;
     } else {
         println!("{}", String::from_utf8(bytes)?);
     }
@@ -211,6 +389,13 @@ pub struct Rules {
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub comparison_policy: crate::analysis::RegressionPolicy,
+    #[serde(default)]
+    pub comparison_query: String,
+    #[serde(default = "default_unavailable_exit_code")]
+    pub unavailable_exit_code: i32,
+}
+fn default_unavailable_exit_code() -> i32 {
+    EXIT_UNAVAILABLE
 }
 impl Rules {
     pub fn validate(&self) -> Result<()> {
@@ -219,6 +404,11 @@ impl Rules {
             "Unsupported assertion rules version"
         );
         ensure!(!self.rules.is_empty(), "At least one assertion is required");
+        ensure!(
+            [EXIT_ASSERTION, EXIT_UNAVAILABLE].contains(&self.unavailable_exit_code),
+            "Unavailable evidence must exit with 1 or 3"
+        );
+        Query::parse(&self.comparison_query)?;
         ensure!(
             self.comparison_policy.relative_percent.is_finite()
                 && self.comparison_policy.relative_percent >= 0.0,
@@ -326,6 +516,8 @@ impl Rules {
             exit_code,
             results,
             comparison: None,
+            observation_seconds: None,
+            session: None,
         })
     }
 }
@@ -346,6 +538,8 @@ pub struct AssertionReport {
     pub exit_code: i32,
     pub results: Vec<AssertionResult>,
     pub comparison: Option<Comparison>,
+    pub observation_seconds: Option<f64>,
+    pub session: Option<usize>,
 }
 impl AssertionReport {
     pub fn with_comparison(mut self, comparison: Comparison) -> Self {

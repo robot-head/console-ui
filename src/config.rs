@@ -46,13 +46,16 @@ pub enum Palette {
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Native Windows 11 console for Tokio runtime telemetry"
+    about = "Native diagnostics and offline investigation for Tokio runtime telemetry"
 )]
 pub struct Cli {
     /// console-subscriber gRPC endpoint (HTTP or HTTPS over TCP).
     pub target: Option<String>,
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
+    /// Versioned project policy exported by a native workspace.
+    #[arg(long, global = true)]
+    pub policy: Option<PathBuf>,
     /// Time to keep completed tasks/resources; 'none' keeps them indefinitely.
     #[arg(long, global = true)]
     pub retain_for: Option<String>,
@@ -78,6 +81,18 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Action {
+    /// Record a bounded headless observation for offline analysis and CI baselines.
+    Capture {
+        output: PathBuf,
+        #[arg(long, default_value = "10s")]
+        observe: String,
+        #[arg(long, default_value = "10s")]
+        timeout: String,
+        #[arg(long, default_value = "")]
+        histogram_query: String,
+        #[arg(long, default_value_t = 4)]
+        max_streams: usize,
+    },
     /// Evaluate diagnostic budgets against a recording or a live observation interval.
     Check {
         #[command(flatten)]
@@ -203,6 +218,14 @@ impl Settings {
                 crate::preferences::Preferences::load(&path)?.settings
             }
         };
+        if let Some(path) = &cli.policy {
+            let policy = crate::preferences::ProjectPolicy::load(path)?;
+            let defaults = crate::preferences::Preferences {
+                settings: settings.clone(),
+                ..Default::default()
+            };
+            settings = policy.apply(&defaults, None)?.settings;
+        }
         if let Some(target) = &cli.target {
             settings.target.clone_from(target);
         }
