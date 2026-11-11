@@ -33,7 +33,7 @@ Rust background jobs. Closing the final window/quitting destroys workers and
 synchronizes active recordings. The bridge catches Rust panics and returns typed
 JSON action/view results with explicit string ownership (see include/console_ui.h).
 
-Development packages are ad-hoc signed. For public distribution, use a Developer ID
+Development and preview packages are ad-hoc signed. For trusted distribution, use a Developer ID
 Application identity to sign the CLI, Rust library, and main executable with hardened
 runtime and timestamp, then sign the outer app. Submit the resulting ZIP using
 `xcrun notarytool submit --keychain-profile <profile> --wait`, staple the accepted
@@ -82,9 +82,9 @@ match. Update them together before tagging. For example, after merging the workf
 
 ```sh
 gh workflow run release.yml --ref master
-# When releasing version 0.2.0 from the intended, reviewed commit:
-git tag v0.2.0 <commit>
-git push origin v0.2.0
+# When releasing version 0.1.0 from the intended, reviewed commit:
+git tag v0.1.0 <commit>
+git push origin v0.1.0
 ```
 
 Release archives are named `console-ui-<version>-windows-x64.zip`,
@@ -92,6 +92,8 @@ Release archives are named `console-ui-<version>-windows-x64.zip`,
 `console-ui-<version>-macos-arm64.zip`. Each has a `.sha256` sidecar and a JSON
 manifest with schema version, application version, platform, source commit, archive
 name, and SHA-256 digest. Only the draft-release job receives `contents: write`;
-build and verification jobs use read access. Drafts require the release operator's
-signing/notarization and clean-machine checks before public publication. If signing
-changes an archive, regenerate its checksum and manifest before uploading it.
+build and verification jobs use read access. Production releases require the release
+operator's signing/notarization and clean-machine checks before publication. Preview
+releases must identify unsigned or ad-hoc-signed builds and any pending platform checks
+in their release notes. If signing changes an archive, regenerate its checksum and
+manifest before uploading it.
