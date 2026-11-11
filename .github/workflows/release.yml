@@ -1,0 +1,220 @@
+name: Release builds
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  # Exercise packaging changes without creating a tag or a GitHub release.
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - 'scripts/build-macos.sh'
+      - 'scripts/package-*'
+      - 'scripts/smoke-*'
+      - 'platforms/macos/Info.plist'
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release version
+        id: version
+        shell: python
+        run: |
+          import os, pathlib, plistlib, re, subprocess, tomllib
+          root = pathlib.Path('.')
+          version = tomllib.loads((root / 'Cargo.toml').read_text())['package']['version']
+          gtk_version = tomllib.loads((root / 'platforms/linux/Cargo.toml').read_text())['package']['version']
+          with (root / 'platforms/macos/Info.plist').open('rb') as stream:
+              mac = plistlib.load(stream)
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?', version), 'Invalid release version'
+          assert gtk_version == version, 'GTK and core versions differ'
+          assert mac['CFBundleShortVersionString'] == version, 'macOS app version differs'
+          assert mac['CFBundleVersion'] == version, 'macOS bundle version differs'
+          ref = os.environ['GITHUB_REF']
+          if ref.startswith('refs/tags/'):
+              assert ref == 'refs/tags/v' + version, 'Tag must match v<Cargo version>'
+          sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write(f'version={version}\nsource_sha={sha}\n')
+  checks:
+    needs: metadata
+    # PR previews run alongside CI; tag and manual builds must pass the reusable CI workflow.
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/ci.yml
+  packages:
+    needs: [metadata, checks]
+    if: >-
+      ${{ !cancelled() && needs.metadata.result == 'success' &&
+          (needs.checks.result == 'success' || needs.checks.result == 'skipped') }}
+    name: Package ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-2025
+            source: dist/console-ui-win-x64.zip
+            extension: zip
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            source: dist/console-ui-linux-x86_64.tar.gz
+            extension: tar.gz
+          - platform: macos-arm64
+            runner: macos-15
+            source: dist/console-ui-macos-arm64.zip
+            extension: zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-linux-desktop
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.platform }}
+      - run: cargo build --locked --example instrumented -p console-ui
+      - name: Package and test Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/package-windows.ps1 -Architecture x64
+          $extracted = Join-Path $env:RUNNER_TEMP 'release-windows'
+          Expand-Archive dist/console-ui-win-x64.zip -DestinationPath $extracted
+          ./scripts/smoke-windows.ps1 -Executable (Join-Path $extracted 'console-ui.exe')
+      - name: Package and test Linux archive
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          bash scripts/package-linux.sh
+          extracted="$RUNNER_TEMP/release-linux"
+          mkdir -p "$extracted"
+          tar -xzf dist/console-ui-linux-x86_64.tar.gz -C "$extracted"
+          "$extracted/bin/console-ui" --help >/dev/null
+          bash scripts/smoke-linux.sh x11 "$extracted/bin/console-ui-gtk"
+          bash scripts/smoke-linux.sh wayland "$extracted/bin/console-ui-gtk"
+      - name: Package and test macOS archive
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash scripts/package-macos.sh
+          extracted="$RUNNER_TEMP/release-macos"
+          mkdir -p "$extracted"
+          ditto -x -k dist/console-ui-macos-arm64.zip "$extracted"
+          codesign --verify --deep --strict "$extracted/Console UI.app"
+          "$extracted/Console UI.app/Contents/MacOS/console-ui" --help >/dev/null
+          bash scripts/smoke-macos.sh "$extracted/Console UI.app/Contents/MacOS/ConsoleUI"
+      - name: Stage versioned archive and provenance
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
+          PACKAGE_SOURCE: ${{ matrix.source }}
+          PACKAGE_EXTENSION: ${{ matrix.extension }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, shutil
+          source = pathlib.Path(os.environ['PACKAGE_SOURCE'])
+          output = pathlib.Path('dist/release')
+          output.mkdir(parents=True, exist_ok=True)
+          version, platform = os.environ['RELEASE_VERSION'], os.environ['RELEASE_PLATFORM']
+          name = f"console-ui-{version}-{platform}.{os.environ['PACKAGE_EXTENSION']}"
+          archive = output / name
+          shutil.copyfile(source, archive)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (output / (name + '.sha256')).write_text(f'{digest}  {name}\n', encoding='ascii')
+          manifest = {'schema_version': 1, 'version': version, 'platform': platform,
+                      'source_revision': os.environ['SOURCE_SHA'], 'archive': name, 'sha256': digest}
+          (output / f'console-ui-{version}-{platform}.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package-${{ matrix.platform }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-smoke-${{ matrix.platform }}
+          path: dist/smoke-*
+          retention-days: 14
+  verify-artifacts:
+    name: Verify release assets
+    needs: [metadata, packages]
+    if: ${{ !cancelled() && needs.metadata.result == 'success' && needs.packages.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+      SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-package-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify all release assets
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib
+          root = pathlib.Path('release-assets')
+          expected = {'windows-x64': 'zip', 'linux-x86_64': 'tar.gz', 'macos-arm64': 'zip'}
+          manifests = [json.loads(path.read_text()) for path in root.glob('*.json')]
+          assert len(manifests) == 3 and {m['platform'] for m in manifests} == set(expected), 'Missing platform assets'
+          for manifest in manifests:
+              assert manifest['version'] == os.environ['RELEASE_VERSION'], 'Version mismatch'
+              assert manifest['source_revision'] == os.environ['SOURCE_SHA'], 'Source mismatch'
+              assert manifest['schema_version'] == 1, 'Unsupported manifest schema'
+              name = manifest['archive']
+              assert name == f"console-ui-{manifest['version']}-{manifest['platform']}.{expected[manifest['platform']]}", 'Unexpected archive name'
+              assert pathlib.Path(name).name == name, 'Invalid archive path'
+              digest = hashlib.sha256((root / name).read_bytes()).hexdigest()
+              assert digest == manifest['sha256'], 'Archive checksum mismatch'
+              assert (root / (name + '.sha256')).read_text().strip() == f'{digest}  {name}', 'Sidecar checksum mismatch'
+  draft-release:
+    name: Stage draft GitHub release
+    needs: [metadata, verify-artifacts]
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+      SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-package-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create or refresh draft assets
+        shell: bash
+        run: |
+          tag_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          test "$tag_commit" = "$SOURCE_SHA"
+          if gh release view "$RELEASE_TAG" --json isDraft > release-state.json 2>/dev/null; then
+            python3 -c 'import json; assert json.load(open("release-state.json"))["isDraft"], "Refusing to replace assets on a published release"'
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Console UI $RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber

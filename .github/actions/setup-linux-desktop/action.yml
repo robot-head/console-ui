@@ -1,0 +1,23 @@
+name: Set up Linux desktop dependencies
+description: Install the Ubuntu 24.04 GTK4 and X11/Wayland smoke-test dependencies.
+runs:
+  using: composite
+  steps:
+    - name: Install GTK and display-test dependencies
+      shell: bash
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_MODE: a
+      run: |
+        # Probe mirrors first so an unavailable DNS host cannot stall every package.
+        gtk_mirror=''
+        for candidate in https://archive.ubuntu.com/ubuntu/ https://mirrors.edge.kernel.org/ubuntu/ https://mirror.math.princeton.edu/pub/ubuntu/; do
+          if curl -4 --fail --silent --show-error --connect-timeout 5 --max-time 15 "${candidate}dists/noble/InRelease" -o "$RUNNER_TEMP/gtk-inrelease"; then
+            gtk_mirror="$candidate"
+            break
+          fi
+        done
+        test -n "$gtk_mirror"
+        printf '%s\n' "$gtk_mirror" | sudo tee /etc/apt/apt-mirrors.txt /etc/apt/apt-mirrors-security.txt >/dev/null
+        sudo -E apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+        sudo -E apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends libgtk-4-dev xvfb xauth dbus-x11 weston fonts-dejavu-core

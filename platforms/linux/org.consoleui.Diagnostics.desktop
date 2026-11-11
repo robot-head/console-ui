@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Console UI
+Comment=Inspect Tokio tasks and runtime resources
+Exec=console-ui-gtk
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Development;Debugger;

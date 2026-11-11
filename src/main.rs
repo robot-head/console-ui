@@ -1,3 +1,216 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+use anyhow::{Result, bail};
+use clap::{CommandFactory, Parser};
+use console_ui::{
+    config::{Action, Cli, Settings},
+    telemetry::{ConnectionStatus, Worker},
+};
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
+
 fn main() {
-    println!("Hello, world!");
+    #[cfg(all(windows, not(debug_assertions)))]
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(u32::MAX);
+    }
+    let cli = Cli::parse();
+    #[cfg(windows)]
+    let gui = cli.command.is_none();
+    if let Err(error) = run(cli) {
+        eprintln!("{error:#}");
+        #[cfg(windows)]
+        if gui {
+            console_ui::ui::show_error(&format!("{error:#}"));
+        }
+        std::process::exit(
+            error
+                .downcast_ref::<console_ui::automation::CliFailure>()
+                .map_or(1, |e| e.code),
+        );
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    if let Some(Action::GenCompletion { shell }) = cli.command {
+        clap_complete::generate(
+            shell,
+            &mut Cli::command(),
+            "console-ui",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
+    let settings = Settings::load(&cli).map_err(|e| {
+        if matches!(
+            &cli.command,
+            Some(Action::Check { .. } | Action::Capture { .. })
+        ) {
+            anyhow::Error::new(console_ui::automation::CliFailure {
+                code: 2,
+                message: format!("{e:#}"),
+            })
+        } else {
+            e
+        }
+    })?;
+    match &cli.command {
+        Some(Action::Capture {
+            output,
+            observe,
+            timeout,
+            histogram_query,
+            max_streams,
+        }) => console_ui::automation::capture(
+            output,
+            observe,
+            timeout,
+            histogram_query,
+            *max_streams,
+            &settings,
+        ),
+        Some(Action::Check { options }) => {
+            let code = console_ui::automation::check(options, &settings)?;
+            if code != 0 {
+                return Err(console_ui::automation::CliFailure {
+                    code,
+                    message: "Diagnostic assertions did not pass; see the result report".into(),
+                }
+                .into());
+            }
+            Ok(())
+        }
+        Some(Action::Sessions { input }) => {
+            let recording = console_ui::investigation::Recording::open(input)?;
+            println!("{}", serde_json::to_string_pretty(&recording.sessions)?);
+            Ok(())
+        }
+        Some(Action::Compare {
+            baseline,
+            current,
+            baseline_session,
+            current_session,
+            output,
+        }) => {
+            if let Some(output) = output {
+                console_ui::sharing::preserve_source(baseline, output)?;
+                console_ui::sharing::preserve_source(current, output)?;
+            }
+            let (a, sa) =
+                console_ui::automation::capture_window(baseline, *baseline_session, &settings)?;
+            let (b, sb) =
+                console_ui::automation::capture_window(current, *current_session, &settings)?;
+            let comparison = console_ui::analysis::compare(&a, &b, [sa, sb], &Default::default())?;
+            let bytes = serde_json::to_vec_pretty(&comparison)?;
+            if let Some(path) = output {
+                console_ui::preferences::atomic_write(path, &bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+            Ok(())
+        }
+        Some(Action::Export {
+            input,
+            output,
+            format,
+            table,
+            query,
+            session,
+            at_ns,
+            chart_task,
+            redact_fields,
+            redact_paths,
+            redact_endpoint,
+        }) => {
+            console_ui::sharing::preserve_source(input, output)?;
+            let mut recording = console_ui::investigation::Recording::open(input)?;
+            let info = recording
+                .sessions
+                .get(*session)
+                .ok_or_else(|| anyhow::anyhow!("Session is unavailable"))?
+                .clone();
+            let cursor = at_ns.unwrap_or(info.end);
+            let snapshot = recording.seek(*session, cursor, &settings)?;
+            anyhow::ensure!(
+                chart_task.is_none_or(|id| snapshot.tasks.iter().any(|t| t.id == id)),
+                "Chart task is unavailable at this cursor"
+            );
+            let points = recording
+                .history(*session, cursor, &settings)?
+                .points_for(*chart_task);
+            let snapshot = console_ui::query::Query::parse(query)?.filter(&snapshot);
+            let mut document =
+                console_ui::sharing::ExportDocument::new(*session as u64, info.target, snapshot);
+            document.range = Some([info.start, cursor]);
+            document.chart_task = *chart_task;
+            document.notes.push("Tables show lifetime counters at the cursor; charts use bounded interval history and label their task or aggregate scope.".into());
+            let policy = console_ui::sharing::RedactionPolicy {
+                fields: redact_fields.iter().cloned().collect(),
+                source_paths: *redact_paths,
+                endpoints: *redact_endpoint,
+            };
+            let document = policy.document(&document);
+            match format.as_str() {
+                "json" => document.json(output)?,
+                "csv" => document.csv(output, table)?,
+                "html" => document.report(output, &points, None)?,
+                "svg" => console_ui::preferences::atomic_write(
+                    output,
+                    console_ui::sharing::chart_svg_scoped(&points, table, *chart_task)?.as_bytes(),
+                )?,
+                _ => anyhow::bail!("Choose json, csv, html, or svg export format"),
+            };
+            Ok(())
+        }
+        Some(Action::GenConfig) => {
+            print!("{}", toml::to_string_pretty(&settings)?);
+            Ok(())
+        }
+        Some(Action::Dump { timeout, output }) => {
+            let timeout = humantime::parse_duration(timeout)?;
+            let worker = Worker::start(settings, cli.record, cli.replay)?;
+            let deadline = Instant::now() + timeout;
+            loop {
+                let state = worker.read();
+                if state.snapshot.updates > 0 || state.status == ConnectionStatus::Offline {
+                    if let Some(error) = state.error {
+                        bail!("{error}");
+                    }
+                    let json = serde_json::to_vec_pretty(&state.snapshot)?;
+                    if let Some(path) = output {
+                        std::fs::write(path, json)?;
+                    } else {
+                        std::io::stdout().write_all(&json)?;
+                        println!();
+                    }
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "No telemetry received within {timeout:?}: {}",
+                        state
+                            .error
+                            .as_deref()
+                            .unwrap_or("target is not publishing updates")
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        Some(Action::GenCompletion { .. }) => unreachable!(),
+        None => {
+            #[cfg(windows)]
+            {
+                console_ui::ui::run(settings, cli.record, cli.replay, cli.policy)
+            }
+            #[cfg(not(windows))]
+            {
+                bail!(
+                    "Launch console-ui-gtk on Linux or Console UI.app on macOS. This executable provides capture, replay dump, check, compare, export, and configuration commands on every platform."
+                );
+            }
+        }
+    }
 }

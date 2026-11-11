@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "comparison_query": "entity:task name:worker-0",
+  "unavailable_exit_code": 3,
+  "comparison_policy": {
+    "relative_percent": 25.0,
+    "absolute_ns": 5000000,
+    "polls_increase": 100,
+    "added_is_regression": true,
+    "removed_is_regression": true
+  },
+  "rules": [
+    { "name": "worker scheduling budget", "query": "name:worker-0", "metric": "scheduled_ns", "maximum": 1000000000 },
+    { "name": "worker poll latency", "query": "name:worker-0", "metric": "poll_p99_ns", "maximum": 100000000 },
+    { "name": "worker poll budget", "query": "name:worker-0", "metric": "polls", "maximum": 10000 }
+  ]
+}
