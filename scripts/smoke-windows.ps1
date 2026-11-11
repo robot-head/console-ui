@@ -66,7 +66,10 @@ try {
     $first = Wait-For { $table.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $itemCondition) } 'task row'
     $first.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $firstId = $first.Current.Name.Split(',')[0]
-    $script:root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern).Resize(1180, 780)
+    if ($firstId -notmatch '^ID [0-9]+$') { throw "Task row is missing its accessible entity ID: $firstId" }
+    $transform = $script:root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
+    $transform.Move(0, 0)
+    $transform.Resize(1180, 780)
     Wait-For {
         [NativeSmokeWindow]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
         [NativeSmokeWindow]::GetForegroundWindow() -eq $app.MainWindowHandle

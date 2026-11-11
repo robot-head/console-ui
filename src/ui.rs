@@ -802,10 +802,6 @@ impl Console {
     }
     fn table(&self, context: &ViewContext<Self>) -> View {
         let rows = self.rows();
-        let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
-        let selected_index = self
-            .selected
-            .and_then(|id| ids.iter().position(|v| *v == id));
         let preferences = self
             .tables
             .get(self.table_key())
@@ -865,13 +861,12 @@ impl Console {
                 "Start an instrumented application, check the endpoint, or clear the filter.",
             )
         } else {
-            ListView::new()
-                .selected_index(selected_index)
+            ListBox::new()
                 .automation_name("Live telemetry table")
-                .on_selection_changed(context.callback(move |index: Option<usize>| {
-                    Message::Select(index.and_then(|i| ids.get(i).copied()))
+                .on_selected_tag_changed(context.callback(|tag: Option<Rc<str>>| {
+                    Message::Select(tag.and_then(|tag| tag.parse().ok()))
                 }))
-                .items(rows.into_iter().map(|row| {
+                .keyed_items(rows.into_iter().map(|row| {
                     let description = row
                         .cells
                         .iter()
@@ -905,11 +900,21 @@ impl Console {
                         .width(width)
                         .content(content)
                         .on_click(context.message(Message::Select(Some(row.id))));
-                    DataItem::new(row.id, description).content(if self.selected == Some(row.id) {
-                        frame.element_ref(&self.selected_row)
-                    } else {
-                        frame
-                    })
+                    // Own the native item instead of a data-template wrapper:
+                    // its accessible name and selection tag survive column content
+                    // changes, and selection is identified by entity ID.
+                    keyed(
+                        row.id,
+                        ListBoxItem::new()
+                            .automation_name(description)
+                            .tag(row.id.to_string())
+                            .is_selected(self.selected == Some(row.id))
+                            .content(if self.selected == Some(row.id) {
+                                frame.element_ref(&self.selected_row)
+                            } else {
+                                frame
+                            }),
+                    )
                 }))
                 .into()
         };
