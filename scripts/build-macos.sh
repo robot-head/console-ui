@@ -4,8 +4,8 @@ project_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$project_root"
 profile="${1:-dev}"
 case "$profile" in
-  dev) profile_root=target/debug; cargo_flags=(); swift_flags=(-Onone -g) ;;
-  release) profile_root=target/release; cargo_flags=(--release); swift_flags=(-O) ;;
+  dev) profile_root=target/debug; cargo_flags=(--profile dev); swift_flags=(-Onone -g) ;;
+  release) profile_root=target/release; cargo_flags=(--profile release); swift_flags=(-O) ;;
   *) echo 'Usage: build-macos.sh [dev|release]' >&2; exit 2 ;;
 esac
 export MACOSX_DEPLOYMENT_TARGET=14.0
