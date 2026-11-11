@@ -28,6 +28,9 @@ type Queue = Arc<(Mutex<Option<Request>>, Condvar)>;
 static QUEUE: OnceLock<Option<Queue>> = OnceLock::new();
 
 pub(crate) fn request(window: usize, row: String) {
+    if std::env::var_os("CONSOLE_UI_TRACE_SCROLL").is_some() {
+        eprintln!("Native scroll queued for window {window:x}: {row}");
+    }
     let queue = QUEUE.get_or_init(|| {
         let queue: Queue = Arc::new((Mutex::new(None), Condvar::new()));
         let worker = queue.clone();
@@ -89,6 +92,10 @@ fn run(queue: Queue) -> Result<()> {
             );
         }
         if process != std::process::id() {
+            eprintln!(
+                "Native scroll skipped: window belongs to process {process}, expected {}",
+                std::process::id()
+            );
             continue;
         }
         if let Err(error) = scroll(&automation, &request) {
@@ -112,6 +119,11 @@ fn scroll(automation: &IUIAutomation, request: &Request) -> Result<()> {
             let scroll: IUIAutomationScrollItemPattern =
                 row.GetCurrentPatternAs(UIA_ScrollItemPatternId)?;
             scroll.ScrollIntoView()?;
+            if std::env::var_os("CONSOLE_UI_TRACE_SCROLL").is_some() {
+                eprintln!("Native scroll completed: {}", request.row);
+            }
+        } else if std::env::var_os("CONSOLE_UI_TRACE_SCROLL").is_some() {
+            eprintln!("Native scroll skipped deselected row: {}", request.row);
         }
     }
     Ok(())

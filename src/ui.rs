@@ -189,10 +189,13 @@ impl Component for Console {
             Message::FocusSelection => {
                 if let Some(id) = self.selected {
                     let row = self.row_automation_id(id);
-                    let _ = context.run_window(move |window| {
+                    let queued = context.run_window(move |window| {
                         crate::windows_scroll::request(window.as_raw() as usize, row);
                         Message::SelectionScrolled
                     });
+                    if !queued {
+                        eprintln!("Native scroll window request was not accepted");
+                    }
                 }
                 let queued = self.selected_row.request_focus_result(|result| {
                     if !matches!(result, Ok(true)) {
@@ -924,6 +927,7 @@ impl Console {
                     // Use a native focusable control so WinUI can bring the
                     // keyboard selection into view, including offscreen rows.
                     let frame = Button::new()
+                        .automation_name(description.clone())
                         .style(ButtonStyle::Subtle)
                         .width(width)
                         .content(content)

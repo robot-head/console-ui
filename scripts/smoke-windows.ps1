@@ -53,7 +53,9 @@ function Capture([string]$Name) {
 try {
     $demo = Start-Process "$PSScriptRoot/../target/debug/examples/instrumented.exe" -PassThru
     $capture = "$PSScriptRoot/../dist/smoke-native-recording.tcui"
-    $app = Start-Process (Resolve-Path $Executable) -ArgumentList @('--record', $capture) -PassThru
+    $env:CONSOLE_UI_TRACE_SCROLL = '1'
+    $appError = "$PSScriptRoot/../dist/smoke-app-error.log"
+    $app = Start-Process (Resolve-Path $Executable) -ArgumentList @('--record', $capture) -PassThru -RedirectStandardError $appError
     $script:root = Wait-For {
         $app.Refresh()
         if ($app.HasExited) { throw "App exited with $($app.ExitCode)" }
@@ -136,13 +138,14 @@ try {
 } catch {
     try {
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
-        Write-Output "Keyboard focus: $($focused.Current.Name); process $($focused.Current.ProcessId)"
+        Write-Output "Keyboard focus: $($focused.Current.Name); process $($focused.Current.ProcessId); automation ID $($focused.Current.AutomationId)"
         if ($table) {
             $chosen = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
-            foreach ($row in $chosen) { Write-Output "Selected row: $($row.Current.Name); offscreen $($row.Current.IsOffscreen)" }
+            foreach ($row in $chosen) { Write-Output "Selected row: $($row.Current.Name); offscreen $($row.Current.IsOffscreen); automation ID $($row.Current.AutomationId)" }
         }
         Capture 'failure'
     } catch { Write-Output "Unable to capture smoke failure: $_" }
+    if ($appError -and (Test-Path $appError)) { Get-Content $appError -Tail 30 | Write-Output }
     throw
 } finally {
     if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id -Force }
