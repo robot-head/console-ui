@@ -58,6 +58,9 @@ pub struct Tab {
     pub window_ns: Option<u64>,
     pub policy: HistogramPolicy,
     last_session: u64,
+    seek_generation: u64,
+    seeking: bool,
+    seek_request: Option<(usize, u64)>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceDocument {
@@ -71,8 +74,22 @@ pub struct WorkspaceDocument {
 enum Job {
     Open(Box<Opened>),
     Finished(String),
-    OpenFailed { tab: u64, message: String },
+    OpenFailed {
+        tab: u64,
+        message: String,
+    },
     Compared(Box<Comparison>),
+    Seeked {
+        tab: u64,
+        generation: u64,
+        result: Result<Box<Seeked>>,
+    },
+}
+struct Seeked {
+    recording: Recording,
+    snapshot: Snapshot,
+    history: History,
+    session: usize,
 }
 struct Opened {
     tab: u64,
@@ -80,6 +97,7 @@ struct Opened {
     snapshot: Snapshot,
     investigation: Investigation,
     restore: Option<InvestigationView>,
+    history: History,
 }
 pub struct Workspace {
     pub preferences: Preferences,
@@ -92,6 +110,9 @@ pub struct Workspace {
     pub notice: Option<String>,
     pub comparison: Option<Comparison>,
     pub pending: usize,
+    pub report_sections: Vec<String>,
+    preview_policy: Option<RedactionPolicy>,
+    lookup_query: Option<String>,
     path: PathBuf,
     cli_settings: Option<Settings>,
     session_settings: Option<Settings>,
@@ -104,6 +125,20 @@ pub struct Workspace {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
     Tick,
+    Lookup {
+        text: String,
+    },
+    SelectInSession {
+        kind: String,
+        id: u64,
+        session: u64,
+    },
+    Preview {
+        policy: RedactionPolicy,
+    },
+    ReportSections {
+        sections: Vec<String>,
+    },
     AddTarget {
         target: String,
         name: String,
@@ -222,6 +257,14 @@ pub enum Action {
     DeleteView {
         name: String,
     },
+    RenameView {
+        name: String,
+        new_name: String,
+    },
+    DuplicateView {
+        name: String,
+        new_name: String,
+    },
     SaveWorkspace {
         path: PathBuf,
         name: String,
@@ -274,6 +317,11 @@ pub struct View {
     pub recording: Option<PathBuf>,
     pub session: u64,
     pub snapshot: Snapshot,
+    pub inspection: Snapshot,
+    pub lookup_tasks: Vec<TaskRow>,
+    pub export_preview: Option<ExportDocument>,
+    pub report_sections: Vec<String>,
+    pub project_presets: Vec<String>,
     pub unfiltered_counts: [usize; 3],
     pub query: String,
     pub selection: Option<Selection>,
@@ -326,6 +374,9 @@ impl Workspace {
             notice: None,
             comparison: None,
             pending: 0,
+            report_sections: crate::sharing::default_report_sections(),
+            preview_policy: None,
+            lookup_query: None,
             path,
             session_settings: cli_settings.clone(),
             cli_settings,
@@ -405,6 +456,9 @@ impl Workspace {
             window_ns: None,
             policy: HistogramPolicy::default(),
             last_session: 0,
+            seek_generation: 0,
+            seeking: false,
+            seek_request: None,
         });
         self.active = id;
         self.preferences.remember(&target)?;
@@ -438,6 +492,9 @@ impl Workspace {
             window_ns: None,
             policy: HistogramPolicy::default(),
             last_session: 0,
+            seek_generation: 0,
+            seeking: false,
+            seek_request: None,
         });
         self.active = tab;
         self.pending += 1;
@@ -452,6 +509,10 @@ impl Workspace {
                 } else {
                     recording.final_snapshot(&settings)?
                 };
+                let session = restore
+                    .as_ref()
+                    .map_or_else(|| recording.sessions.last().unwrap().index, |v| v.session);
+                let history = recording.history(session, snapshot.now, &settings)?;
                 let sidecar = Investigation::sidecar(&path);
                 let mut investigation = if sidecar.exists() {
                     Investigation::load(&sidecar)?
@@ -471,6 +532,7 @@ impl Workspace {
                     snapshot,
                     investigation,
                     restore,
+                    history,
                 })))
             })();
             let job = result.unwrap_or_else(|error| Job::OpenFailed {
@@ -502,6 +564,33 @@ impl Workspace {
                     }
                     self.notice = Some(message);
                 }
+                Ok(Job::Seeked {
+                    tab,
+                    generation,
+                    result,
+                }) => {
+                    if let Some(target) = self.tabs.iter_mut().find(|t| t.document.id == tab) {
+                        target.seeking = false;
+                        if generation == target.seek_generation {
+                            match result {
+                                Ok(result) => {
+                                    let mut state = target.worker.state.write().unwrap();
+                                    state.snapshot = Arc::new(result.snapshot);
+                                    state.session = result.session as u64 + 1;
+                                    state.error = None;
+                                    target.history = result.history;
+                                    target.recording = Some(result.recording);
+                                }
+                                Err(error) => {
+                                    if let Some(p) = &mut target.playback {
+                                        p.playing = false;
+                                    }
+                                    self.notice = Some(format!("Seek recording: {error:#}"));
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(Job::Open(opened)) => {
                     let Opened {
                         tab,
@@ -509,6 +598,7 @@ impl Workspace {
                         snapshot,
                         investigation,
                         restore,
+                        history,
                     } = *opened;
                     if let Some(target) = self.tabs.iter_mut().find(|t| t.document.id == tab) {
                         let (session, cursor) = restore
@@ -525,6 +615,7 @@ impl Workspace {
                             live.error = None;
                         }
                         target.last_session = session as u64 + 1;
+                        target.history = history;
                         target.playback = Some(Playback::new(session, cursor));
                         target.window_ns = restore
                             .as_ref()
@@ -532,11 +623,13 @@ impl Workspace {
                         let warning = recording.warnings.join("; ");
                         target.recording = Some(recording);
                         target.investigation = Some(investigation);
+                        let mut missing_selection = false;
                         if let Some((kind, id)) = restore.and_then(|v| v.selected) {
                             let live = target.worker.read();
                             let exists = if kind == "task" {
                                 live.snapshot.tasks.iter().any(|t| t.id == id)
                             } else {
+                                missing_selection = true;
                                 live.snapshot.resources.iter().any(|r| r.id == id)
                             };
                             if exists {
@@ -554,7 +647,7 @@ impl Workspace {
                         }
                         if !warning.is_empty() {
                             self.notice = Some(warning);
-                        } else if self.pending == 0 {
+                        } else if self.pending == 0 && !missing_selection {
                             self.notice = None;
                         }
                     }
@@ -565,16 +658,57 @@ impl Workspace {
         for tab in &mut self.tabs {
             if let (Some(recording), Some(playback)) = (&mut tab.recording, &mut tab.playback) {
                 let end = recording.sessions[playback.session].end;
-                if playback.tick(end) {
-                    let snapshot =
-                        recording.seek(playback.session, playback.cursor, &self.settings)?;
-                    tab.worker.state.write().unwrap().snapshot = Arc::new(snapshot);
+                if !tab.seeking && tab.seek_request.is_none() && playback.tick(end) {
+                    tab.seek_generation += 1;
+                    tab.seek_request = Some((playback.session, playback.cursor));
                 }
+            }
+            if !tab.seeking
+                && let Some((session, cursor)) = tab.seek_request.take()
+            {
+                tab.seeking = true;
+                self.pending += 1;
+                let mut recording = tab.recording.as_ref().unwrap().fork();
+                let settings = self.settings.clone();
+                let sender = self.jobs.clone();
+                let id = tab.document.id;
+                let generation = tab.seek_generation;
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<Box<Seeked>> {
+                        let snapshot = recording.seek(session, cursor, &settings)?;
+                        let history = recording.history(session, cursor, &settings)?;
+                        Ok(Box::new(Seeked {
+                            recording,
+                            snapshot,
+                            history,
+                            session,
+                        }))
+                    })();
+                    let _ = sender.send(Ok(Job::Seeked {
+                        tab: id,
+                        generation,
+                        result,
+                    }));
+                });
             }
             let live = tab.worker.read();
             if live.session != tab.last_session {
                 tab.selection = None;
                 tab.last_session = live.session;
+            }
+            if tab
+                .selection
+                .as_ref()
+                .is_some_and(|s| !match s.kind.as_str() {
+                    "task" => live.snapshot.tasks.iter().any(|t| t.id == s.id),
+                    "resource" => live.snapshot.resources.iter().any(|r| r.id == s.id),
+                    "operation" => live.snapshot.async_ops.iter().any(|o| o.id == s.id),
+                    _ => false,
+                })
+            {
+                tab.selection = None;
+                self.notice =
+                    Some("The selected entity is no longer retained at this position".into());
             }
             if !live.paused && live.status == ConnectionStatus::Connected {
                 tab.history.push(live.session, &live.snapshot);
@@ -604,19 +738,24 @@ impl Workspace {
         Ok(())
     }
     fn seek(&mut self, session: usize, cursor: u64) -> Result<()> {
-        let settings = self.settings.clone();
         let tab = self.current_mut();
-        let recording = tab.recording.as_mut().context("Open a recording first")?;
-        let snapshot = recording.seek(session, cursor, &settings)?;
+        let recording = tab.recording.as_ref().context("Open a recording first")?;
+        let info = recording
+            .sessions
+            .get(session)
+            .context("Session is unavailable")?;
+        ensure!(
+            (info.start..=info.end).contains(&cursor),
+            "Cursor lies outside the selected session"
+        );
         let playback = tab.playback.as_mut().unwrap();
         if playback.session != session {
             tab.selection = None;
         }
         playback.session = session;
         playback.seek(cursor);
-        let mut state = tab.worker.state.write().unwrap();
-        state.snapshot = Arc::new(snapshot);
-        state.session = session as u64 + 1;
+        tab.seek_generation += 1;
+        tab.seek_request = Some((session, cursor));
         Ok(())
     }
     fn annotations(&mut self) -> Result<&mut Investigation> {
@@ -646,10 +785,61 @@ impl Workspace {
         tasks.truncate(100);
         tasks
     }
+    fn rename_view(&mut self, name: &str, new_name: &str, duplicate: bool) -> Result<()> {
+        ensure!(!new_name.trim().is_empty(), "View needs a name");
+        let views = self.view()?.views;
+        ensure!(
+            !views.iter().any(|v| v.name == new_name),
+            "A view with that name already exists"
+        );
+        let mut view = views
+            .into_iter()
+            .find(|v| v.name == name)
+            .context("View is unavailable")?;
+        view.name = new_name.to_owned();
+        if self.views.iter().any(|v| v.name == name) {
+            if !duplicate {
+                self.views.retain(|v| v.name != name);
+            }
+            self.views.push(view);
+            self.preferences.saved_views = self.views.clone();
+            self.persist()?;
+        } else {
+            let investigation = self.annotations()?;
+            if !duplicate {
+                investigation.views.retain(|v| v.name != name);
+            }
+            investigation.views.push(view);
+            self.save_annotations()?;
+        }
+        Ok(())
+    }
     pub fn dispatch(&mut self, action: Action) -> Result<()> {
-        self.notice = None;
+        if !matches!(&action, Action::Tick) {
+            self.notice = None;
+        }
+        let duplicate_view = matches!(&action, Action::DuplicateView { .. });
         match action {
             Action::Tick => self.tick()?,
+            Action::Lookup { text } => self.lookup_query = Some(text),
+            Action::SelectInSession { kind, id, session } => {
+                ensure!(
+                    session == self.current().worker.read().session,
+                    "The runtime session changed; find the entity again"
+                );
+                self.select(kind, id)?;
+            }
+            Action::Preview { policy } => self.preview_policy = Some(policy),
+            Action::ReportSections { sections } => {
+                ensure!(
+                    !sections.is_empty()
+                        && sections
+                            .iter()
+                            .all(|s| crate::sharing::default_report_sections().contains(s)),
+                    "Choose known report sections"
+                );
+                self.report_sections = sections;
+            }
             Action::AddTarget { target, name } => self.add_target(target, name, None)?,
             Action::SelectTab { id } => {
                 ensure!(
@@ -873,6 +1063,8 @@ impl Workspace {
                     .sessions[playback.session];
                 if !playback.playing && playback.cursor >= info.end {
                     playback.seek(info.start);
+                    tab.seek_generation += 1;
+                    tab.seek_request = Some((playback.session, playback.cursor));
                 }
                 playback.toggle();
             }
@@ -1003,6 +1195,11 @@ impl Workspace {
                     self.save_annotations()?;
                 }
             }
+            Action::RenameView { name, new_name } | Action::DuplicateView { name, new_name } => {
+                // Variant identity is captured before this match so rename can remove
+                // the old entry while duplicate keeps the original document.
+                self.rename_view(&name, &new_name, duplicate_view)?;
+            }
             Action::SaveWorkspace { path, name } => {
                 ensure!(!name.trim().is_empty(), "Workspace needs a name");
                 self.name = name;
@@ -1130,15 +1327,36 @@ impl Workspace {
                     .as_ref()
                     .context("Recording is still loading")?
                     .session;
+                let duration = current.window_ns;
+                let cursor = current.playback.as_ref().unwrap().cursor;
                 let settings = self.settings.clone();
                 let sender = self.jobs.clone();
                 self.pending += 1;
                 self.notice = Some("Comparing captures…".into());
                 std::thread::spawn(move || {
                     let result = (|| -> Result<Job> {
-                        let (a, sa) = crate::automation::capture_window(&path, session, &settings)?;
-                        let (b, sb) =
-                            crate::automation::capture_window(&source, selected, &settings)?;
+                        let range = if let Some(duration) = duration {
+                            let baseline = Recording::open(&path)?;
+                            let info = baseline
+                                .sessions
+                                .get(session)
+                                .context("Baseline session is unavailable")?;
+                            ensure!(
+                                info.end.saturating_sub(info.start) >= duration,
+                                "Baseline session is shorter than the selected window"
+                            );
+                            Some([info.end - duration, info.end])
+                        } else {
+                            None
+                        };
+                        let (a, sa) =
+                            crate::automation::capture_range(&path, session, &settings, range)?;
+                        let (b, sb) = crate::automation::capture_range(
+                            &source,
+                            selected,
+                            &settings,
+                            duration.map(|ns| [cursor.saturating_sub(ns), cursor]),
+                        )?;
                         Ok(Job::Compared(Box::new(analysis::compare(
                             &a,
                             &b,
@@ -1159,11 +1377,20 @@ impl Workspace {
                 let live = tab.worker.read();
                 let snapshot = Query::parse(&tab.document.filter)?.filter(&live.snapshot);
                 let mut document = ExportDocument::new(live.session, Some(live.target), snapshot);
+                document.sections = self.report_sections.clone();
                 document.range = tab
                     .window_ns
                     .map(|ns| [live.snapshot.now.saturating_sub(ns), live.snapshot.now]);
+                document.notes.push("Table and inspector counters are lifetime values at the cursor. The selected range scopes trend charts and window summaries; it does not change lifetime counters.".into());
                 let document = redaction.document(&document);
-                let points = tab.history.points();
+                let points = tab
+                    .history
+                    .points()
+                    .into_iter()
+                    .filter(|p| {
+                        p.now <= live.snapshot.now && document.range.is_none_or(|r| p.now >= r[0])
+                    })
+                    .collect::<Vec<_>>();
                 let comparison = if redaction.fields.is_empty()
                     && !redaction.source_paths
                     && !redaction.endpoints
@@ -1212,6 +1439,32 @@ impl Workspace {
             .filter(|s| s.session == live.session)
             .cloned();
         let focus = selected.as_ref().map(|s| format!("{}:{}", s.kind, s.id));
+        let mut inspection = (*live.snapshot).clone();
+        inspection.tasks.retain(|t| {
+            selected
+                .as_ref()
+                .is_some_and(|s| s.kind == "task" && s.id == t.id)
+        });
+        inspection.resources.retain(|r| {
+            selected
+                .as_ref()
+                .is_some_and(|s| s.kind == "resource" && s.id == r.id)
+        });
+        inspection.async_ops.retain(|o| {
+            selected.as_ref().is_some_and(|s| {
+                (s.kind == "operation" && s.id == o.id)
+                    || (s.kind == "resource" && s.id == o.resource_id)
+            })
+        });
+        inspection
+            .details
+            .retain(|id, _| inspection.tasks.iter().any(|t| t.id == *id));
+        let export_preview = self.preview_policy.as_ref().map(|policy| {
+            let mut doc =
+                ExportDocument::new(live.session, Some(live.target.clone()), snapshot.clone());
+            doc.sections = self.report_sections.clone();
+            policy.document(&doc)
+        });
         let evidence = snapshot
             .tasks
             .iter()
@@ -1232,6 +1485,19 @@ impl Workspace {
         }
         Ok(View {
             name: self.name.clone(),
+            inspection,
+            lookup_tasks: self
+                .lookup_query
+                .as_ref()
+                .map_or(vec![], |q| self.find_tasks(q)),
+            export_preview,
+            report_sections: self.report_sections.clone(),
+            project_presets: self
+                .project_policy
+                .presets
+                .iter()
+                .map(|p| p.name.clone())
+                .collect(),
             active: self.active,
             tabs: self
                 .tabs
@@ -1263,7 +1529,12 @@ impl Workspace {
                 .history
                 .points()
                 .into_iter()
-                .filter(|p| p.now <= live.snapshot.now)
+                .filter(|p| {
+                    p.now <= live.snapshot.now
+                        && tab
+                            .window_ns
+                            .is_none_or(|ns| p.now >= live.snapshot.now.saturating_sub(ns))
+                })
                 .collect(),
             window: tab.window_ns.map(|ns| {
                 tab.history

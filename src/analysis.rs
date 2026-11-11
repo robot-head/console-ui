@@ -12,6 +12,7 @@ use std::{
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Counters {
+    pub total: u64,
     pub busy: u64,
     pub scheduled: u64,
     pub polls: u64,
@@ -19,6 +20,7 @@ pub struct Counters {
 impl From<&Timing> for Counters {
     fn from(t: &Timing) -> Self {
         Self {
+            total: t.total,
             busy: t.busy,
             scheduled: t.scheduled,
             polls: t.polls,
@@ -120,7 +122,12 @@ impl History {
                 };
                 let mut polls = 0u64;
                 for (id, end) in &b.tasks {
-                    if let Some(start) = a.tasks.get(id) {
+                    let zero = Counters::default();
+                    if let Some(start) = a
+                        .tasks
+                        .get(id)
+                        .or_else(|| (end.total <= b.now.saturating_sub(a.now)).then_some(&zero))
+                    {
                         point.busy_ns = point
                             .busy_ns
                             .saturating_add(end.busy.saturating_sub(start.busy));
@@ -128,9 +135,14 @@ impl History {
                             .scheduled_ns
                             .saturating_add(end.scheduled.saturating_sub(start.scheduled));
                         polls = polls.saturating_add(end.polls.saturating_sub(start.polls));
-                        point.gap |= end.busy < start.busy || end.polls < start.polls;
+                        point.gap |= end.busy < start.busy
+                            || end.polls < start.polls
+                            || end.scheduled < start.scheduled;
+                    } else {
+                        point.gap = true;
                     }
                 }
+                point.gap |= a.tasks.keys().any(|id| !b.tasks.contains_key(id));
                 let seconds = b.now.saturating_sub(a.now) as f64 / 1e9;
                 point.polls_per_second = if seconds > 0.0 {
                     polls as f64 / seconds
@@ -171,12 +183,23 @@ impl History {
                 polls: counters
                     .map(|s| task.timing.polls.saturating_sub(s.polls))
                     .unwrap_or(if new { task.timing.polls } else { 0 }),
-                available: counters.is_some() || new,
+                available: counters.map_or(new, |s| {
+                    task.timing.busy >= s.busy
+                        && task.timing.scheduled >= s.scheduled
+                        && task.timing.polls >= s.polls
+                }),
             });
         }
-        WindowSummary { start:anchor.now, end:current.now,
-            complete:anchor.now <= since && anchor.dropped_events == current.dropped_events && tasks.iter().all(|t| t.available),
-            tasks, note:(anchor.now > since).then(|| "The requested range starts before retained history; values cover the available interval".into()) }
+        let missing = anchor
+            .tasks
+            .keys()
+            .any(|id| !current.tasks.iter().any(|t| t.id == *id));
+        let complete = anchor.now <= since
+            && anchor.dropped_events == current.dropped_events
+            && tasks.iter().all(|t| t.available)
+            && !missing;
+        WindowSummary { start:anchor.now, end:current.now, complete, tasks,
+            note: (!complete).then(|| "The range contains unavailable history, pruned tasks, dropped events, or counter resets; values cover the available evidence".into()) }
     }
     pub fn retained_bytes(&self) -> usize {
         self.bytes
@@ -204,10 +227,16 @@ pub fn interval(baseline: &Snapshot, current: &Snapshot) -> (Snapshot, bool) {
     let span = current.now.saturating_sub(baseline.now);
     let mut incomplete =
         current.now <= baseline.now || current.dropped_events > baseline.dropped_events;
+    incomplete |= baseline
+        .tasks
+        .iter()
+        .any(|old| !current.tasks.iter().any(|t| t.id == old.id));
     for task in &mut result.tasks {
         if let Some(old) = baseline.tasks.iter().find(|t| t.id == task.id) {
-            incomplete |=
-                task.timing.polls < old.timing.polls || task.timing.busy < old.timing.busy;
+            incomplete |= task.timing.polls < old.timing.polls
+                || task.timing.busy < old.timing.busy
+                || task.timing.scheduled < old.timing.scheduled;
+            task.timing.total = task.timing.total.saturating_sub(old.timing.total);
             task.timing.busy = task.timing.busy.saturating_sub(old.timing.busy);
             task.timing.scheduled = task.timing.scheduled.saturating_sub(old.timing.scheduled);
             task.timing.idle = task.timing.idle.saturating_sub(old.timing.idle);
@@ -231,6 +260,27 @@ pub fn interval(baseline: &Snapshot, current: &Snapshot) -> (Snapshot, bool) {
             incomplete |= task.timing.total > span;
         }
         task.timing.total = task.timing.total.min(span);
+    }
+    for resource in &mut result.resources {
+        if let Some(old) = baseline.resources.iter().find(|r| r.id == resource.id) {
+            resource.total = resource.total.saturating_sub(old.total);
+        } else {
+            incomplete |= resource.total > span;
+        }
+        resource.total = resource.total.min(span);
+    }
+    for op in &mut result.async_ops {
+        if let Some(old) = baseline.async_ops.iter().find(|o| o.id == op.id) {
+            incomplete |= op.timing.busy < old.timing.busy || op.timing.polls < old.timing.polls;
+            op.timing.total = op.timing.total.saturating_sub(old.timing.total);
+            op.timing.busy = op.timing.busy.saturating_sub(old.timing.busy);
+            op.timing.scheduled = op.timing.scheduled.saturating_sub(old.timing.scheduled);
+            op.timing.idle = op.timing.idle.saturating_sub(old.timing.idle);
+            op.timing.polls = op.timing.polls.saturating_sub(old.timing.polls);
+        } else {
+            incomplete |= op.timing.total > span;
+        }
+        op.timing.total = op.timing.total.min(span);
     }
     (result, incomplete)
 }
@@ -329,8 +379,31 @@ pub fn contention_graph(snapshot: &Snapshot, focus: Option<&str>, limit: usize) 
             .collect();
         graph.nodes.retain(|n| keys.contains(&n.key));
     }
-    graph.truncated = graph.nodes.len() > limit;
-    graph.nodes.truncate(limit);
+    // Keep connected pairs together. A large task list must not crowd every resource
+    // out of the bounded graph and hide all contention evidence.
+    let original_len = graph.nodes.len();
+    let mut selected = BTreeSet::new();
+    if let Some(focus) = focus {
+        selected.insert(focus.to_owned());
+    }
+    for edge in &graph.edges {
+        let additional = [&edge.from, &edge.to]
+            .iter()
+            .filter(|key| !selected.contains(**key))
+            .count();
+        if selected.len() + additional <= limit {
+            selected.insert(edge.from.clone());
+            selected.insert(edge.to.clone());
+        }
+    }
+    for node in &graph.nodes {
+        if selected.len() >= limit {
+            break;
+        }
+        selected.insert(node.key.clone());
+    }
+    graph.nodes.retain(|n| selected.contains(&n.key));
+    graph.truncated = graph.nodes.len() < original_len;
     let keys: BTreeSet<_> = graph.nodes.iter().map(|n| &n.key).collect();
     graph
         .edges
@@ -344,6 +417,8 @@ pub struct RegressionPolicy {
     pub relative_percent: f64,
     pub absolute_ns: u64,
     pub polls_increase: u64,
+    pub added_is_regression: bool,
+    pub removed_is_regression: bool,
 }
 impl Default for RegressionPolicy {
     fn default() -> Self {
@@ -351,13 +426,18 @@ impl Default for RegressionPolicy {
             relative_percent: 10.0,
             absolute_ns: 1_000_000,
             polls_increase: 100,
+            added_is_regression: false,
+            removed_is_regression: false,
         }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ComparisonRow {
     pub key: String,
+    pub kind: String,
     pub name: String,
+    pub warnings_added: Vec<String>,
+    pub warnings_removed: Vec<String>,
     pub baseline: Option<u64>,
     pub current: Option<u64>,
     pub status: String,
@@ -365,6 +445,7 @@ pub struct ComparisonRow {
     pub scheduled_per_second: [f64; 2],
     pub polls_per_second: [f64; 2],
     pub poll_p99_ns: [Option<u64>; 2],
+    pub scheduled_p99_ns: [Option<u64>; 2],
     pub regression: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -387,27 +468,104 @@ pub fn compare(
         policy.relative_percent.is_finite() && policy.relative_percent >= 0.0,
         "Regression percentage must be nonnegative"
     );
-    fn group(s: &Snapshot) -> BTreeMap<String, Vec<&TaskRow>> {
-        let mut m = BTreeMap::<String, Vec<&TaskRow>>::new();
+    struct Entity {
+        id: u64,
+        kind: &'static str,
+        name: String,
+        timing: Timing,
+        warnings: BTreeSet<String>,
+        p99: Option<u64>,
+        scheduled_p99: Option<u64>,
+    }
+    fn task_key(t: &TaskRow) -> String {
+        serde_json::to_string(&("task", &t.name, &t.target, &t.location, t.blocking)).unwrap()
+    }
+    fn resource_key(r: &crate::model::ResourceRow) -> String {
+        serde_json::to_string(&(
+            "resource",
+            &r.kind,
+            &r.concrete_type,
+            &r.target,
+            &r.location,
+            r.internal,
+        ))
+        .unwrap()
+    }
+    fn percentile(d: &crate::model::Distribution) -> Option<u64> {
+        (d.error.is_none() && d.high_outliers == 0 && d.count > 0)
+            .then(|| d.percentiles.get(6).copied())
+            .flatten()
+    }
+    fn group(s: &Snapshot) -> BTreeMap<String, Vec<Entity>> {
+        let mut entities = BTreeMap::<String, Vec<Entity>>::new();
         for t in &s.tasks {
-            m.entry(format!(
-                "{}|{}|{}|{}",
-                t.name, t.target, t.location, t.blocking
-            ))
-            .or_default()
-            .push(t);
+            let d = s.details.get(&t.id);
+            entities.entry(task_key(t)).or_default().push(Entity {
+                id: t.id,
+                kind: "task",
+                name: t.name.clone(),
+                timing: t.timing.clone(),
+                warnings: t.warnings.iter().map(|w| w.name().to_owned()).collect(),
+                p99: d.and_then(|d| percentile(&d.poll)),
+                scheduled_p99: d.and_then(|d| percentile(&d.scheduled)),
+            });
         }
-        m
+        for r in &s.resources {
+            let mut timing = Timing {
+                total: r.total,
+                ..Default::default()
+            };
+            for op in s.async_ops.iter().filter(|op| op.resource_id == r.id) {
+                timing.busy = timing.busy.saturating_add(op.timing.busy);
+                timing.idle = timing.idle.saturating_add(op.timing.idle);
+                timing.polls = timing.polls.saturating_add(op.timing.polls);
+            }
+            entities.entry(resource_key(r)).or_default().push(Entity {
+                id: r.id,
+                kind: "resource",
+                name: r.concrete_type.clone(),
+                timing,
+                warnings: BTreeSet::new(),
+                p99: None,
+                scheduled_p99: None,
+            });
+        }
+        for op in &s.async_ops {
+            let resource = s
+                .resources
+                .iter()
+                .find(|r| r.id == op.resource_id)
+                .map(resource_key);
+            let task = op
+                .task_id
+                .and_then(|id| s.tasks.iter().find(|t| t.id == id))
+                .map(task_key);
+            let key = serde_json::to_string(&("operation", resource, task, &op.source)).unwrap();
+            entities.entry(key).or_default().push(Entity {
+                id: op.id,
+                kind: "operation",
+                name: format!("{} / {}", op.task_name, op.source),
+                timing: op.timing.clone(),
+                warnings: BTreeSet::new(),
+                p99: None,
+                scheduled_p99: None,
+            });
+        }
+        entities
     }
     let left = group(a);
     let right = group(b);
     let keys: BTreeSet<_> = left.keys().chain(right.keys()).cloned().collect();
+    let regressed = |values: [f64; 2], absolute: f64| {
+        values[1] - values[0] > absolute
+            && (values[0] == 0.0 || (values[1] / values[0] - 1.0) * 100.0 > policy.relative_percent)
+    };
     let mut rows = vec![];
     for key in keys {
         let aa = left.get(&key);
         let bb = right.get(&key);
-        let at = aa.and_then(|v| v.first()).copied();
-        let bt = bb.and_then(|v| v.first()).copied();
+        let at = aa.and_then(|v| v.first());
+        let bt = bb.and_then(|v| v.first());
         let ambiguous = aa.is_some_and(|v| v.len() > 1) || bb.is_some_and(|v| v.len() > 1);
         let metric = |f: fn(&Timing) -> u64| {
             [
@@ -418,28 +576,35 @@ pub fn compare(
         let busy = metric(|t| t.busy);
         let scheduled = metric(|t| t.scheduled);
         let polls = metric(|t| t.polls);
-        let p99 = [
-            at.and_then(|t| a.details.get(&t.id))
-                .and_then(|d| d.poll.percentiles.get(6).copied()),
-            bt.and_then(|t| b.details.get(&t.id))
-                .and_then(|d| d.poll.percentiles.get(6).copied()),
+        let p99 = [at.and_then(|t| t.p99), bt.and_then(|t| t.p99)];
+        let scheduled_p99 = [
+            at.and_then(|t| t.scheduled_p99),
+            bt.and_then(|t| t.scheduled_p99),
         ];
-        let regressed = |values: [f64; 2], absolute: f64| {
-            values[1] - values[0] > absolute
-                && (values[0] == 0.0
-                    || (values[1] / values[0] - 1.0) * 100.0 > policy.relative_percent)
+        let quantile_regression = |values: [Option<u64>; 2]| {
+            values[0]
+                .zip(values[1])
+                .is_some_and(|(x, y)| regressed([x as f64, y as f64], policy.absolute_ns as f64))
         };
-        let regression = at.is_some()
-            && bt.is_some()
-            && !ambiguous
-            && (regressed(busy, policy.absolute_ns as f64)
-                || regressed(scheduled, policy.absolute_ns as f64)
-                || regressed(polls, policy.polls_increase as f64)
-                || p99[0].zip(p99[1]).is_some_and(|(x, y)| {
-                    regressed([x as f64, y as f64], policy.absolute_ns as f64)
-                }));
+        let regression = !ambiguous
+            && match (at, bt) {
+                (None, Some(_)) => policy.added_is_regression,
+                (Some(_), None) => policy.removed_is_regression,
+                (Some(_), Some(_)) => {
+                    regressed(busy, policy.absolute_ns as f64)
+                        || regressed(scheduled, policy.absolute_ns as f64)
+                        || regressed(polls, policy.polls_increase as f64)
+                        || quantile_regression(p99)
+                        || quantile_regression(scheduled_p99)
+                }
+                _ => false,
+            };
+        let empty = BTreeSet::new();
+        let aw = at.map_or(&empty, |t| &t.warnings);
+        let bw = bt.map_or(&empty, |t| &t.warnings);
         rows.push(ComparisonRow {
             key,
+            kind: bt.or(at).unwrap().kind.into(),
             name: bt.or(at).unwrap().name.clone(),
             baseline: at.map(|t| t.id),
             current: bt.map(|t| t.id),
@@ -459,9 +624,12 @@ pub fn compare(
             scheduled_per_second: scheduled,
             polls_per_second: polls,
             poll_p99_ns: p99,
+            scheduled_p99_ns: scheduled_p99,
             regression,
+            warnings_added: bw.difference(aw).cloned().collect(),
+            warnings_removed: aw.difference(bw).cloned().collect(),
         });
     }
-    rows.sort_by_key(|r| (!r.regression, r.name.clone()));
-    Ok(Comparison { schema_version:1, rows, notes:vec!["Identity uses name, target, source, and task kind; ambiguous groups are not asserted as regressions.".into(),"Rates use the provided observation durations. Missing histograms are unknown; HDR percentiles exclude reported outliers.".into()] })
+    rows.sort_by_key(|r| (!r.regression, r.kind.clone(), r.name.clone()));
+    Ok(Comparison { schema_version:1,rows,notes:vec!["Entities match by source, target, kind and name; resource operations also include their task/resource identity. Duplicate identities are ambiguous, never asserted as regressions.".into(),"Rates use observation-window deltas. Resource busy/poll rates aggregate its operations. Missing or outlier-limited histograms are unknown. Added/removed entities follow the configured policy.".into()] })
 }

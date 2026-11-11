@@ -375,6 +375,7 @@ fn assertions_distinguish_failures_missing_samples_and_invalid_configuration() {
     let snapshot = sample(101, 20, 10);
     let rules = Rules {
         schema_version: 1,
+        comparison_policy: Default::default(),
         rules: vec![Rule {
             name: "poll budget".into(),
             query: "name:worker".into(),

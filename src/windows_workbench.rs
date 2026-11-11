@@ -42,6 +42,9 @@ pub enum Message {
     Flag(&'static str, bool),
     Apply(&'static str),
     Pick(Action),
+    Lookup,
+    FocusLookup,
+    EditBookmark(u64),
     Jump(Selection),
     NativeSelection(Option<Selection>),
     Column { key: String, change: ColumnChange },
@@ -60,6 +63,8 @@ pub struct Workbench {
     timer: ComponentTimer,
     navigation: u64,
     dialog: bool,
+    lookup: ElementRef<TextBox>,
+    focus_timer: Option<ComponentTimer>,
     tx: mpsc::Sender<(u64, Option<Action>)>,
     rx: mpsc::Receiver<(u64, Option<Action>)>,
 }
@@ -80,6 +85,8 @@ impl Component for Workbench {
             timer: context.set_local_timeout(Duration::from_millis(250), || Message::Tick),
             navigation: 0,
             dialog: false,
+            lookup: ElementRef::new(),
+            focus_timer: None,
             tx,
             rx,
         }
@@ -94,11 +101,37 @@ impl Component for Workbench {
                     while let Ok((tab, action)) = self.rx.try_recv() {
                         self.dialog = false;
                         if let Some(action) = action {
-                            if self.app.tabs.iter().any(|t| t.document.id == tab) {
-                                self.app.dispatch(Action::SelectTab { id: tab })?;
+                            if !self.app.tabs.iter().any(|t| t.document.id == tab) {
+                                continue;
                             }
+                            self.app.dispatch(Action::SelectTab { id: tab })?;
                             self.app.dispatch(action)?;
                         }
+                    }
+                }
+                Message::Lookup => {
+                    self.panel = Panel::Filters;
+                    self.focus_timer = Some(
+                        context
+                            .set_local_timeout(Duration::from_millis(50), || Message::FocusLookup),
+                    );
+                }
+                Message::FocusLookup => {
+                    let _ = self.lookup.request_focus();
+                }
+                Message::EditBookmark(id) => {
+                    if let Some(bookmark) = self
+                        .app
+                        .current()
+                        .investigation
+                        .as_ref()
+                        .and_then(|i| i.bookmarks.iter().find(|b| b.id == id))
+                    {
+                        self.fields.insert("bookmark_id", Rc::from(id.to_string()));
+                        self.fields
+                            .insert("bookmark_name", Rc::from(bookmark.name.as_str()));
+                        self.fields
+                            .insert("bookmark_note", Rc::from(bookmark.note.as_str()));
                     }
                 }
                 Message::Panel(index) => {
@@ -127,6 +160,11 @@ impl Component for Workbench {
                 Message::Action(action) => self.app.dispatch(action)?,
                 Message::Apply(form) => self.apply(form)?,
                 Message::Pick(action) => {
+                    let action = if matches!(&action, Action::Compare { .. }) {
+                        self.comparison_request()?
+                    } else {
+                        action
+                    };
                     if self.dialog {
                         return Ok(());
                     }
@@ -139,6 +177,10 @@ impl Component for Workbench {
                     });
                 }
                 Message::Jump(selection) => {
+                    anyhow::ensure!(
+                        selection.session == self.app.current().worker.read().session,
+                        "The runtime session changed; find the task again"
+                    );
                     self.app.dispatch(Action::Select {
                         kind: selection.kind,
                         id: selection.id,
@@ -221,6 +263,8 @@ impl Component for Workbench {
                     tables: tab.document.tables.clone(),
                     navigation: tab.selection.clone().map(|s| (self.navigation, s)),
                     on_selection: context.callback(Message::NativeSelection),
+                    on_target: context
+                        .callback(|target| Message::Action(Action::Connect { target })),
                     on_query: context
                         .callback(|expression| Message::Action(Action::Filter { expression })),
                     on_settings: context
@@ -324,6 +368,16 @@ impl Component for Workbench {
         if let Some(path) = live.recording {
             top.push(text(&format!("Recording to {}", path.display())).into());
         }
+        let sender = context.sender();
+        let keys =
+            Border::new().on_preview_key_down(RoutedCallback::new(move |event: KeyEventInfo| {
+                if event.key == VirtualKey::K && event.modifiers.contains(InputModifiers::CONTROL) {
+                    let _ = sender.send(Message::Lookup);
+                    true
+                } else {
+                    false
+                }
+            }));
         let layout = Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .row_spacing(8.0)
@@ -340,7 +394,7 @@ impl Component for Workbench {
                         Border::new().grid_column(1).content(content),
                     )),
             ));
-        context.window_frame("Console UI  /  Tokio diagnostics", layout)
+        context.window_frame("Console UI  /  Tokio diagnostics", keys.content(layout))
     }
 }
 
@@ -397,6 +451,30 @@ impl Workbench {
             },
             "filter" => Action::Filter {
                 expression: self.value("query", &self.app.current().document.filter),
+            },
+            "report_sections" => Action::ReportSections {
+                sections: self
+                    .value("report_sections", "charts,tasks,resources,comparison")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            "rename_view" => Action::RenameView {
+                name: self.value("view_original", ""),
+                new_name: self.value("view_name", ""),
+            },
+            "duplicate_view" => Action::DuplicateView {
+                name: self.value("view_original", ""),
+                new_name: self.value("view_name", ""),
+            },
+            "project_preset" => Action::SaveProjectPreset {
+                name: self.value("preset_name", ""),
+            },
+            "rename_profile" => Action::RenameProfile {
+                name: self.value("profile_name", ""),
+                new_name: self.value("profile_new_name", ""),
             },
             "preset" => Action::SavePreset {
                 name: self.value("preset_name", ""),
@@ -524,6 +602,7 @@ impl Workbench {
         let mut controls = vec![
             heading("Connections"),
             self.entry("profile_name", "Profile or tab name", "", c),
+            self.entry("profile_new_name", "New profile name", "", c),
             self.entry(
                 "endpoint",
                 "Telemetry endpoint",
@@ -539,6 +618,7 @@ impl Workbench {
                 ),
                 button("Open target in new tab", c, Message::Apply("add_tab")),
                 button("Save profile", c, Message::Apply("profile")),
+                button("Rename profile", c, Message::Apply("rename_profile")),
             ]),
         ];
         for p in &self.app.preferences.profiles {
@@ -574,7 +654,16 @@ impl Workbench {
     }
     fn filters(&self, c: &ViewContext<Self>) -> View {
         let mut controls=vec![heading("Filters and task lookup"),text("Combine clauses with AND (spaces), use | for OR, ! for negation, and quotes for values with spaces.").into(),self.entry("query","Filter expression",&self.app.current().document.filter,c),row(vec![button("Apply filter",c,Message::Apply("filter")),button("Clear",c,Message::Action(Action::Filter{expression:String::new()}))]),text("Examples: busy>5ms !state:completed   |   warning:self-wakes   |   field.request.id:123").into(),self.entry("preset_name","Preset name","",c),button("Save current filter as preset",c,Message::Apply("preset"))];
-        for p in &self.app.preferences.filter_presets {
+        controls.push(button(
+            "Save preset in this project",
+            c,
+            Message::Apply("project_preset"),
+        ));
+        let effective = self
+            .app
+            .effective_preferences()
+            .unwrap_or_else(|_| self.app.preferences.clone());
+        for p in &effective.filter_presets {
             controls.push(row(vec![
                 text(&p.name).into(),
                 button(
@@ -587,13 +676,35 @@ impl Workbench {
                 button(
                     "Delete",
                     c,
-                    Message::Action(Action::DeletePreset {
-                        name: p.name.clone(),
-                    }),
+                    Message::Action(
+                        if self
+                            .app
+                            .project_policy
+                            .presets
+                            .iter()
+                            .any(|x| x.name == p.name)
+                        {
+                            Action::DeleteProjectPreset {
+                                name: p.name.clone(),
+                            }
+                        } else {
+                            Action::DeletePreset {
+                                name: p.name.clone(),
+                            }
+                        },
+                    ),
                 ),
             ]));
         }
-        controls.push(self.entry("lookup", "Find task by name or ID", "", c));
+        controls.push(
+            TextBox::new()
+                .text(self.value("lookup", ""))
+                .placeholder_text("Find task by name or ID · Ctrl+K")
+                .automation_name("Find task by name or ID")
+                .element_ref(&self.lookup)
+                .on_text_changed(c.callback(|value| Message::Text("lookup", value)))
+                .into(),
+        );
         let session = self.app.current().worker.read().session;
         for task in self.app.find_tasks(&self.value("lookup", "")) {
             controls.push(button(
@@ -646,6 +757,7 @@ impl Workbench {
                 text(&key).width(140.0).into(),
                 NumberBox::new()
                     .width(140.0)
+                    .automation_name(format!("{table} {key} column width"))
                     .minimum(32.0)
                     .maximum(2000.0)
                     .value(Some(width))
@@ -656,6 +768,7 @@ impl Workbench {
                     .into(),
                 CheckBox::new()
                     .content("Visible")
+                    .automation_name(format!("{table} {key} column visible"))
                     .is_checked(visible)
                     .on_is_checked_changed(c.callback(move |value: Option<bool>| Message::Column {
                         key: visible_key.clone(),
@@ -795,35 +908,18 @@ impl Workbench {
                 );
             }
         }
-        controls.push(heading("Recent poll activity"));
-        let max = view
-            .trends
-            .iter()
-            .map(|p| p.polls_per_second)
-            .fold(1.0, f64::max);
-        for point in view.trends.iter().rev().take(30).rev() {
-            controls.push(row(vec![
-                text(&format!("{} ns", point.now)).width(200.0).into(),
-                ProgressBar::new()
-                    .width(360.0)
-                    .value(point.polls_per_second / max * 100.0)
-                    .automation_name(format!(
-                        "{:.1} polls per second{}",
-                        point.polls_per_second,
-                        if point.gap {
-                            "; incomplete interval"
-                        } else {
-                            ""
-                        }
-                    ))
-                    .into(),
-                text(&format!(
-                    "{:.1} polls/s{}",
-                    point.polls_per_second,
-                    if point.gap { "  GAP" } else { "" }
-                ))
-                .into(),
-            ]));
+        for metric in ["busy", "scheduled", "polls"] {
+            if let Ok(svg) = crate::sharing::chart_svg(&view.trends, metric) {
+                controls.push(
+                    Image::new()
+                        .source_svg(EncodedImage::new(svg.into_bytes()))
+                        .height(240.0)
+                        .automation_name(format!(
+                            "{metric} time series; producer timestamps, gaps and units shown"
+                        ))
+                        .into(),
+                );
+            }
         }
         controls.extend([
             heading("Warning thresholds"),
@@ -993,11 +1089,7 @@ impl Workbench {
                 ))
                 .into(),
                 button("Go", c, Message::Action(Action::GoBookmark { id: b.id })),
-                button(
-                    "Edit",
-                    c,
-                    Message::Text("bookmark_id", Rc::from(b.id.to_string())),
-                ),
+                button("Edit", c, Message::EditBookmark(b.id)),
                 button(
                     "Delete",
                     c,
@@ -1009,25 +1101,19 @@ impl Workbench {
     }
     fn comparison(&self, c: &ViewContext<Self>) -> View {
         let mut controls=vec![heading("Compare diagnostic captures"),text("Open the current recording first, then choose a baseline. Metrics are normalized to each session's observation interval.").into(),self.entry("baseline_session","Baseline session index","0",c),self.entry("regression_percent","Relative regression threshold (%)","10",c),self.entry("regression_ms","Absolute busy/scheduling/latency threshold (ms)","1",c),self.entry("regression_polls","Polling-rate increase threshold (polls/s)","100",c)];
-        let policy = RegressionPolicy {
-            relative_percent: self
-                .value("regression_percent", "10")
-                .parse()
-                .unwrap_or(10.0),
-            absolute_ns: (self
-                .value("regression_ms", "1")
-                .parse::<f64>()
-                .unwrap_or(1.0)
-                * 1e6) as u64,
-            polls_increase: self.value("regression_polls", "100").parse().unwrap_or(100),
-        };
+        controls.push(self.check("added_regression", "Treat added entities as regressions", c));
+        controls.push(self.check(
+            "removed_regression",
+            "Treat removed entities as regressions",
+            c,
+        ));
         controls.push(button(
             "Choose baseline and compare…",
             c,
             Message::Pick(Action::Compare {
                 path: PathBuf::new(),
-                session: self.value("baseline_session", "0").parse().unwrap_or(0),
-                policy,
+                session: 0,
+                policy: Default::default(),
             }),
         ));
         if let Some(comparison) = &self.app.comparison {
@@ -1035,10 +1121,53 @@ impl Workbench {
                 controls.push(text(note).into());
             }
             for r in &comparison.rows {
+                if let Some(id) = r.current {
+                    controls.push(button(
+                        "Inspect current entity",
+                        c,
+                        Message::Jump(Selection {
+                            kind: r.kind.clone(),
+                            id,
+                            session: self.app.current().worker.read().session,
+                        }),
+                    ));
+                }
                 controls.push(text(&format!("{} · {}\nBusy {:.2} → {:.2} ns/s · scheduled {:.2} → {:.2} ns/s · polling {:.2} → {:.2} polls/s",r.name,r.status,r.busy_per_second[0],r.busy_per_second[1],r.scheduled_per_second[0],r.scheduled_per_second[1],r.polls_per_second[0],r.polls_per_second[1])).into());
             }
         }
         stack(controls)
+    }
+    fn comparison_request(&self) -> Result<Action> {
+        let ms: f64 = self
+            .value("regression_ms", "1")
+            .parse()
+            .context("Enter a valid absolute threshold")?;
+        let percent: f64 = self
+            .value("regression_percent", "10")
+            .parse()
+            .context("Enter a valid percentage")?;
+        anyhow::ensure!(
+            ms.is_finite()
+                && ms >= 0.0
+                && ms * 1e6 < u64::MAX as f64
+                && percent.is_finite()
+                && percent >= 0.0,
+            "Regression thresholds must be finite and nonnegative"
+        );
+        Ok(Action::Compare {
+            path: PathBuf::new(),
+            session: self
+                .value("baseline_session", "0")
+                .parse()
+                .context("Enter a session index")?,
+            policy: RegressionPolicy {
+                relative_percent: percent,
+                absolute_ns: (ms * 1e6) as u64,
+                polls_increase: self.value("regression_polls", "100").parse()?,
+                added_is_regression: self.flag("added_regression"),
+                removed_is_regression: self.flag("removed_regression"),
+            },
+        })
     }
     fn redaction(&self) -> RedactionPolicy {
         RedactionPolicy {
@@ -1057,6 +1186,17 @@ impl Workbench {
         let policy = self.redaction();
         let mut controls = vec![
             heading("Export and sharing"),
+            self.entry(
+                "report_sections",
+                "Report sections: charts,tasks,resources,comparison",
+                &self.app.report_sections.join(","),
+                c,
+            ),
+            button(
+                "Apply report sections",
+                c,
+                Message::Apply("report_sections"),
+            ),
             self.entry(
                 "redact_fields",
                 "Redact span/attribute field keys, comma separated",
@@ -1143,6 +1283,16 @@ impl Workbench {
     }
     fn workspace(&self, c: &ViewContext<Self>) -> View {
         let mut controls=vec![heading("Project workspace"),self.entry("workspace_name","Workspace name",&self.app.name,c),row(vec![button("New workspace",c,Message::Apply("new_workspace")),button("Save workspace…",c,Message::Pick(Action::SaveWorkspace{path:PathBuf::new(),name:self.value("workspace_name",&self.app.name)})),button("Open workspace…",c,Message::Pick(Action::OpenWorkspace{path:PathBuf::new()}))]),self.entry("view_name","Investigation view name","",c),button("Save current investigation view",c,Message::Apply("save_view")),text("Project policy precedence: application defaults → project policy → explicit session settings.").into(),row(vec![button("Import project policy…",c,Message::Pick(Action::LoadPolicy{path:PathBuf::new()})),button("Export current project policy…",c,Message::Pick(Action::SavePolicy{path:PathBuf::new()}))])];
+        controls.push(self.entry(
+            "view_original",
+            "Existing view name to rename or duplicate",
+            "",
+            c,
+        ));
+        controls.push(row(vec![
+            button("Rename saved view", c, Message::Apply("rename_view")),
+            button("Duplicate saved view", c, Message::Apply("duplicate_view")),
+        ]));
         if let Ok(view) = self.app.view() {
             for v in view.views {
                 controls.push(row(vec![

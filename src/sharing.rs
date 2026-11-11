@@ -23,6 +23,14 @@ pub struct ExportDocument {
     pub range: Option<[u64; 2]>,
     pub snapshot: Snapshot,
     pub notes: Vec<String>,
+    #[serde(default = "default_report_sections")]
+    pub sections: Vec<String>,
+}
+pub fn default_report_sections() -> Vec<String> {
+    ["charts", "tasks", "resources", "comparison"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
 }
 impl ExportDocument {
     pub fn new(session: u64, target: Option<String>, snapshot: Snapshot) -> Self {
@@ -33,6 +41,7 @@ impl ExportDocument {
             range: None,
             snapshot,
             notes: vec![],
+            sections: default_report_sections(),
         }
     }
     pub fn json(&self, path: &Path) -> Result<()> {
@@ -148,38 +157,47 @@ impl ExportDocument {
         for note in &self.notes {
             html.push_str(&format!("<p class=note>{}</p>", escape(note)));
         }
-        html.push_str("<h2>Polling trend</h2>");
-        html.push_str(&chart_svg(points, "polls")?);
-        html.push_str("<h2>Tasks</h2><table><tr><th>Task</th><th>Busy ns</th><th>Scheduled ns</th><th>Polls</th><th>Warnings</th><th>Source</th></tr>");
-        for t in &self.snapshot.tasks {
-            html.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape(&t.name),
-                t.timing.busy,
-                t.timing.scheduled,
-                t.timing.polls,
-                escape(
-                    &t.warnings
-                        .iter()
-                        .map(|l| l.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                escape(&t.location)
-            ));
+        if self.sections.iter().any(|s| s == "charts") {
+            for metric in ["busy", "scheduled", "polls"] {
+                html.push_str(&chart_svg(points, metric)?);
+            }
         }
-        html.push_str("</table><p>HDR percentiles cover recorded in-range samples; unavailable distributions are unknown. Reports contain the selected retained data.</p>");
-        if let Some(comparison) = comparison {
+        if self.sections.iter().any(|s| s == "tasks") {
+            html.push_str("<h2>Tasks</h2><table><tr><th>Task</th><th>Busy ns</th><th>Scheduled ns</th><th>Polls</th><th>Warnings</th><th>Source</th></tr>");
+            for t in &self.snapshot.tasks {
+                html.push_str(&format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape(&t.name),
+                    t.timing.busy,
+                    t.timing.scheduled,
+                    t.timing.polls,
+                    escape(
+                        &t.warnings
+                            .iter()
+                            .map(|l| l.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    escape(&t.location)
+                ));
+            }
+            html.push_str("</table><p>HDR percentiles cover recorded in-range samples; unavailable distributions are unknown. Reports contain the selected retained data.</p>");
+        }
+        if self.sections.iter().any(|s| s == "comparison")
+            && let Some(comparison) = comparison
+        {
             html.push_str("<h2>Comparison</h2><pre>");
             html.push_str(&escape(&serde_json::to_string_pretty(comparison)?));
             html.push_str("</pre>");
         }
-        html.push_str("<h2>Resources and operations</h2><pre>");
-        html.push_str(&escape(&serde_json::to_string_pretty(&(
-            &self.snapshot.resources,
-            &self.snapshot.async_ops,
-        ))?));
-        html.push_str("</pre>");
+        if self.sections.iter().any(|s| s == "resources") {
+            html.push_str("<h2>Resources and operations</h2><pre>");
+            html.push_str(&escape(&serde_json::to_string_pretty(&(
+                &self.snapshot.resources,
+                &self.snapshot.async_ops,
+            ))?));
+            html.push_str("</pre>");
+        }
         atomic_write(path, html.as_bytes())
     }
 }

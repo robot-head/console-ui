@@ -50,6 +50,14 @@ pub fn capture_window(
     session: usize,
     settings: &crate::config::Settings,
 ) -> Result<(Snapshot, f64)> {
+    capture_range(path, session, settings, None)
+}
+pub fn capture_range(
+    path: &std::path::Path,
+    session: usize,
+    settings: &crate::config::Settings,
+    range: Option<[u64; 2]>,
+) -> Result<(Snapshot, f64)> {
     let mut recording = crate::investigation::Recording::open(path)?;
     let selected = recording
         .sessions
@@ -60,9 +68,14 @@ pub fn capture_window(
         !selected.incomplete && selected.end > selected.start,
         "Capture needs a complete observation interval"
     );
+    let [start, end] = range.unwrap_or([selected.start, selected.end]);
+    ensure!(
+        start >= selected.start && end <= selected.end && end > start,
+        "Comparison range lies outside its session"
+    );
     Ok((
-        recording.window(session, selected.start, selected.end, settings)?,
-        (selected.end - selected.start) as f64 / 1e9,
+        recording.window(session, start, end, settings)?,
+        (end - start) as f64 / 1e9,
     ))
 }
 pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Result<i32> {
@@ -76,9 +89,28 @@ pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Resu
     } else {
         let duration =
             humantime::parse_duration(&options.observe).map_err(|e| failure(EXIT_CONFIG, e))?;
-        ensure!(!duration.is_zero(), "Observation duration must be positive");
+        if duration.is_zero() {
+            return Err(failure(
+                EXIT_CONFIG,
+                "Observation duration must be positive",
+            ));
+        }
         let timeout =
             humantime::parse_duration(&options.timeout).map_err(|e| failure(EXIT_CONFIG, e))?;
+        if timeout.is_zero() {
+            return Err(failure(EXIT_CONFIG, "Telemetry timeout must be positive"));
+        }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = cancelled.clone();
+        std::thread::spawn(move || {
+            if let Ok(runtime) = tokio::runtime::Runtime::new() {
+                runtime.block_on(async {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+        });
         let mut live_settings = settings.clone();
         live_settings.retain_for = "none".into();
         let worker = crate::telemetry::Worker::start(live_settings, None, None)
@@ -90,8 +122,13 @@ pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Resu
                 ..Default::default()
             },
         ));
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| failure(EXIT_CONFIG, "Telemetry timeout is too large"))?;
         let start = loop {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(failure(EXIT_UNAVAILABLE, "Observation cancelled"));
+            }
             let s = worker.read();
             if s.snapshot.updates > 0 {
                 let need_histograms = rules.rules.iter().any(|r| r.metric.ends_with("p99_ns"));
@@ -113,8 +150,13 @@ pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Resu
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let end_time = Instant::now() + duration;
+        let end_time = Instant::now()
+            .checked_add(duration)
+            .ok_or_else(|| failure(EXIT_CONFIG, "Observation duration is too large"))?;
         while Instant::now() < end_time {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(failure(EXIT_UNAVAILABLE, "Observation cancelled"));
+            }
             std::thread::sleep(Duration::from_millis(25));
         }
         let end = worker.read();
@@ -136,7 +178,7 @@ pub fn check(options: &CheckOptions, settings: &crate::config::Settings) -> Resu
             &base,
             &snapshot,
             [base_seconds, seconds],
-            &crate::analysis::RegressionPolicy::default(),
+            &rules.comparison_policy,
         )
         .map_err(|e| failure(EXIT_UNAVAILABLE, e))?;
         report = report.with_comparison(comparison);
@@ -167,6 +209,8 @@ pub struct Rule {
 pub struct Rules {
     pub schema_version: u32,
     pub rules: Vec<Rule>,
+    #[serde(default)]
+    pub comparison_policy: crate::analysis::RegressionPolicy,
 }
 impl Rules {
     pub fn validate(&self) -> Result<()> {
@@ -175,6 +219,11 @@ impl Rules {
             "Unsupported assertion rules version"
         );
         ensure!(!self.rules.is_empty(), "At least one assertion is required");
+        ensure!(
+            self.comparison_policy.relative_percent.is_finite()
+                && self.comparison_policy.relative_percent >= 0.0,
+            "Comparison percentage must be finite and nonnegative"
+        );
         for r in &self.rules {
             ensure!(!r.name.trim().is_empty(), "Assertion needs a name");
             ensure!(
@@ -248,6 +297,13 @@ impl Rules {
                 maximum: rule.maximum,
                 measured,
                 matched_tasks: selected.len(),
+                query: rule.query.clone(),
+                unit: if rule.metric.ends_with("_ns") {
+                    "ns"
+                } else {
+                    "count"
+                }
+                .into(),
                 status: if !available {
                     "unavailable"
                 } else if measured.is_some_and(|m| m > rule.maximum) {
@@ -280,6 +336,8 @@ pub struct AssertionResult {
     pub maximum: f64,
     pub measured: Option<f64>,
     pub matched_tasks: usize,
+    pub query: String,
+    pub unit: String,
     pub status: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

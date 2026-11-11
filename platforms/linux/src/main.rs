@@ -41,6 +41,9 @@ struct Widgets {
     operations: gtk::ListBox,
     details: gtk::Box,
     analysis: gtk::Label,
+    charts: gtk::Box,
+    export_preview: gtk::Label,
+    lookup: gtk::Box,
     sessions: gtk::Box,
     bookmarks: gtk::Box,
     profiles: gtk::Box,
@@ -181,14 +184,14 @@ impl SimpleComponent for App {
                 if let Some(row) = row {
                     let name = row.widget_name();
                     let parts: Vec<_> = name.split(':').collect();
-                    if parts.len() == 3 {
-                        if let (Ok(id), Ok(session)) = (parts[1].parse(), parts[2].parse()) {
-                            sender.input(Msg::Select {
-                                kind: kind.into(),
-                                id,
-                                session,
-                            });
-                        }
+                    if parts.len() == 3
+                        && let (Ok(id), Ok(session)) = (parts[1].parse(), parts[2].parse())
+                    {
+                        sender.input(Msg::Select {
+                            kind: kind.into(),
+                            id,
+                            session,
+                        });
                     }
                 }
             });
@@ -196,6 +199,31 @@ impl SimpleComponent for App {
         let analysis = label("");
         let analysis_page = vertical();
         analysis_page.append(&analysis);
+        let charts = vertical();
+        analysis_page.append(&charts);
+        let range = entry("Analysis window (60s, 5min, none)", "60s");
+        analysis_page.append(&range);
+        {
+            let sender = sender.clone();
+            let button = gtk::Button::with_label("Apply analysis window");
+            button.connect_clicked(move |_| {
+                dispatch_result(
+                    &sender,
+                    (|| -> anyhow::Result<Action> {
+                        let text = range.text();
+                        Ok(Action::Window {
+                            nanoseconds: if text == "none" {
+                                None
+                            } else {
+                                Some(humantime::parse_duration(&text)?.as_nanos().try_into()?)
+                            },
+                        })
+                    })(),
+                );
+            });
+            analysis_page.append(&button);
+        }
+
         let thresholds = horizontal();
         let wake = entry(
             "Self-wake %",
@@ -312,6 +340,47 @@ impl SimpleComponent for App {
         recording_page.append(&bookmark_row);
         let bookmarks = vertical();
         recording_page.append(&bookmarks);
+        let capture_policy = vertical();
+        capture_policy.append(&label(
+            "Histogram capture: inspected, selected IDs, or matching query (at most 32 streams)",
+        ));
+        let mode = entry("Capture mode", "inspected");
+        let ids = entry("Task IDs, comma separated", "");
+        let query = entry("Matching filter", "");
+        let limit = entry("Maximum streams", "4");
+        let rotation = entry("Rotation seconds", "30");
+        for input in [&mode, &ids, &query, &limit, &rotation] {
+            capture_policy.append(input);
+        }
+        {
+            let sender = sender.clone();
+            let button = gtk::Button::with_label("Apply histogram policy");
+            button.connect_clicked(move |_| {
+                dispatch_result(
+                    &sender,
+                    (|| -> anyhow::Result<Action> {
+                        Ok(Action::HistogramPolicy {
+                            policy: console_ui::telemetry::HistogramPolicy {
+                                mode: mode.text().into(),
+                                tasks: ids
+                                    .text()
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::parse)
+                                    .collect::<Result<_, _>>()?,
+                                query: query.text().into(),
+                                max_streams: limit.text().parse()?,
+                                rotate_seconds: rotation.text().parse()?,
+                            },
+                        })
+                    })(),
+                );
+            });
+            capture_policy.append(&button);
+        }
+        recording_page.append(&capture_policy);
+
         notebook.append_page(
             &scrolled(&recording_page),
             Some(&gtk::Label::new(Some("Recording"))),
@@ -352,6 +421,38 @@ impl SimpleComponent for App {
                 name: preset_name.text().into(),
             },
         );
+        let preset_name = name.clone();
+        connect_button(
+            &connections,
+            "Save filter preset in project",
+            sender.clone(),
+            move || Action::SaveProjectPreset {
+                name: preset_name.text().into(),
+            },
+        );
+        let rename = entry("New profile name", "");
+        connections.append(&rename);
+        {
+            let old = name.clone();
+            connect_button(&connections, "Rename profile", sender.clone(), move || {
+                Action::RenameProfile {
+                    name: old.text().into(),
+                    new_name: rename.text().into(),
+                }
+            });
+        }
+        let lookup_entry = entry("Find task by name or ID", "");
+        connections.append(&lookup_entry);
+        {
+            let sender = sender.clone();
+            lookup_entry.connect_changed(move |entry| {
+                sender.input(Msg::Action(Action::Lookup {
+                    text: entry.text().into(),
+                }))
+            });
+        }
+        let lookup = vertical();
+        connections.append(&lookup);
         let presets = vertical();
         connections.append(&presets);
         notebook.append_page(
@@ -451,23 +552,83 @@ impl SimpleComponent for App {
         export.append(&label(
             "Exports use the current filtered snapshot. Redaction preserves the original capture.",
         ));
+        let fields = entry("Redact field keys, comma separated", "");
+        let paths = gtk::CheckButton::with_label("Redact source paths");
+        let endpoints = gtk::CheckButton::with_label("Redact endpoint details");
+        export.append(&fields);
+        export.append(&paths);
+        export.append(&endpoints);
+        let sections = entry(
+            "Report sections: charts,tasks,resources,comparison",
+            "charts,tasks,resources,comparison",
+        );
+        export.append(&sections);
+        {
+            let source = sections.clone();
+            connect_button(
+                &export,
+                "Apply report sections",
+                sender.clone(),
+                move || Action::ReportSections {
+                    sections: source
+                        .text()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                },
+            );
+        }
+        {
+            let fields = fields.clone();
+            let paths = paths.clone();
+            let endpoints = endpoints.clone();
+            connect_button(
+                &export,
+                "Preview redacted export",
+                sender.clone(),
+                move || Action::Preview {
+                    policy: redaction(&fields, &paths, &endpoints),
+                },
+            );
+        }
+        let export_preview = label("Preview scope and fields before exporting.");
+        export.append(&export_preview);
         for (format, table, title) in [
             ("csv", "tasks", "Export tasks CSV…"),
             ("csv", "resources", "Export resources CSV…"),
+            ("csv", "operations", "Export operations CSV…"),
             ("json", "tasks", "Export JSON…"),
             ("html", "tasks", "Export report…"),
             ("svg", "polls", "Export polling chart…"),
+            ("svg", "busy", "Export busy chart…"),
+            ("svg", "scheduled", "Export scheduling chart…"),
+            ("recording", "tasks", "Save redacted capture copy…"),
         ] {
-            picker_button(
+            let fields = fields.clone();
+            let paths = paths.clone();
+            let endpoints = endpoints.clone();
+            picker_dynamic(
                 &export,
                 title,
                 &window,
                 sender.clone(),
-                Action::Export {
-                    path: PathBuf::new(),
-                    format: format.into(),
-                    table: table.into(),
-                    redaction: RedactionPolicy::default(),
+                move || {
+                    let policy = redaction(&fields, &paths, &endpoints);
+                    Ok(if format == "recording" {
+                        Action::RedactRecording {
+                            path: PathBuf::new(),
+                            policy,
+                        }
+                    } else {
+                        Action::Export {
+                            path: PathBuf::new(),
+                            format: format.into(),
+                            table: table.into(),
+                            redaction: policy,
+                        }
+                    })
                 },
                 true,
             );
@@ -492,12 +653,19 @@ impl SimpleComponent for App {
         {
             let sender = sender.clone();
             let filter = filter.clone();
+            let lookup_entry = lookup_entry.clone();
+            let notebook = notebook.clone();
             let endpoint = endpoint.clone();
             shortcuts.connect_key_pressed(move |_, key, _, modifiers| {
                 if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
                     && (key == gtk::gdk::Key::f || key == gtk::gdk::Key::k)
                 {
-                    filter.grab_focus();
+                    if key == gtk::gdk::Key::k {
+                        notebook.set_current_page(Some(5));
+                        lookup_entry.grab_focus();
+                    } else {
+                        filter.grab_focus();
+                    }
                     return glib::Propagation::Stop;
                 }
                 if key == gtk::gdk::Key::F5 {
@@ -535,6 +703,9 @@ impl SimpleComponent for App {
                 operations,
                 details,
                 analysis,
+                charts,
+                export_preview,
+                lookup,
                 sessions,
                 bookmarks,
                 profiles,
@@ -748,21 +919,20 @@ impl SimpleComponent for App {
                 ("resource", &w.resources),
                 ("operation", &w.operations),
             ] {
-                if let Some(selection) = &view.selection {
-                    if selection.kind == kind {
-                        let mut child = list.first_child();
-                        while let Some(widget) = child {
-                            let next = widget.next_sibling();
-                            if let Ok(row) = widget.downcast::<gtk::ListBoxRow>() {
-                                if row.widget_name()
-                                    == format!("{kind}:{}:{}", selection.id, view.session)
-                                {
-                                    list.select_row(Some(&row));
-                                    break;
-                                }
-                            }
-                            child = next;
+                if let Some(selection) = &view.selection
+                    && selection.kind == kind
+                {
+                    let mut child = list.first_child();
+                    while let Some(widget) = child {
+                        let next = widget.next_sibling();
+                        if let Ok(row) = widget.downcast::<gtk::ListBoxRow>()
+                            && row.widget_name()
+                                == format!("{kind}:{}:{}", selection.id, view.session)
+                        {
+                            list.select_row(Some(&row));
+                            break;
                         }
+                        child = next;
                     }
                 }
             }
@@ -784,12 +954,38 @@ impl SimpleComponent for App {
                 });
                 w.profiles.append(&row);
             }
+            clear(&w.lookup);
+            for task in &view.lookup_tasks {
+                let id = task.id;
+                let session = view.session;
+                connect_button(
+                    &w.lookup,
+                    &format!("{} · {} · {}", task.id, task.name, task.location),
+                    sender.clone(),
+                    move || Action::SelectInSession {
+                        kind: "task".into(),
+                        id,
+                        session,
+                    },
+                );
+            }
             clear(&w.presets);
             for p in &view.preferences.filter_presets {
                 let name = p.name.clone();
-                connect_button(&w.presets, &p.name, sender.clone(), move || {
-                    Action::ApplyPreset { name: name.clone() }
+                let row = horizontal();
+                connect_button(&row, &p.name, sender.clone(), move || Action::ApplyPreset {
+                    name: name.clone(),
                 });
+                let name = p.name.clone();
+                let project = view.project_presets.contains(&name);
+                connect_button(&row, "Delete", sender.clone(), move || {
+                    if project {
+                        Action::DeleteProjectPreset { name: name.clone() }
+                    } else {
+                        Action::DeletePreset { name: name.clone() }
+                    }
+                });
+                w.presets.append(&row);
             }
             clear(&w.sessions);
             for s in &view.sessions {
@@ -855,14 +1051,23 @@ impl SimpleComponent for App {
                 }
             }
             w.analysis.set_text(&summary);
+            clear(&w.charts);
+            for metric in ["busy", "scheduled", "polls"] {
+                w.charts.append(&trend_chart(&view.trends, metric));
+            }
+            if let Some(preview) = &view.export_preview {
+                w.export_preview
+                    .set_text(&serde_json::to_string_pretty(preview).unwrap_or_default());
+            }
+
             w.updating.set(false);
         }
         clear(&w.details);
         if let Some(selection) = &view.selection {
             match selection.kind.as_str() {
                 "task" => {
-                    if let Some(t) = view.snapshot.tasks.iter().find(|t| t.id == selection.id) {
-                        task_details(&w.details, t, &view.snapshot);
+                    if let Some(t) = view.inspection.tasks.iter().find(|t| t.id == selection.id) {
+                        task_details(&w.details, t, &view.inspection);
                     }
                 }
                 "resource" => {
@@ -902,12 +1107,44 @@ impl SimpleComponent for App {
             );
         }
         if self.done {
-            println!("NATIVE_GTK_SMOKE_OK");
-            if let Some(app) = w.window.application() {
-                app.quit();
-            }
+            // Let GTK allocate and paint the updated native tree before capturing it.
+            let window = w.window.clone();
+            glib::timeout_add_local_once(Duration::from_millis(200), move || {
+                if let Err(error) = screenshot(&window) {
+                    eprintln!("Capture native GTK smoke screenshot: {error:#}");
+                    std::process::exit(1);
+                }
+                println!("NATIVE_GTK_SMOKE_OK");
+                if let Some(app) = window.application() {
+                    app.quit();
+                }
+            });
         }
     }
+}
+fn screenshot(window: &gtk::ApplicationWindow) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let child = window.child().context("The window has no content")?;
+    let paintable = gtk::WidgetPaintable::new(Some(&child));
+    let snapshot = gtk::Snapshot::new();
+    // WidgetPaintable contains the child tree, so include the window background
+    // explicitly to produce an opaque, readable artifact.
+    snapshot.append_color(
+        &gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0),
+        &gtk::graphene::Rect::new(0.0, 0.0, window.width() as f32, window.height() as f32),
+    );
+    paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+    let node = snapshot
+        .to_node()
+        .context("The native window has no rendered frame")?;
+    let renderer = window
+        .renderer()
+        .context("The native renderer is unavailable")?;
+    let texture = renderer.render_texture(&node, None);
+    std::fs::create_dir_all("dist")?;
+    let backend = std::env::var("GDK_BACKEND").unwrap_or_else(|_| "native".into());
+    texture.save_to_png(format!("dist/smoke-linux-{backend}.png"))?;
+    Ok(())
 }
 fn vertical() -> gtk::Box {
     gtk::Box::new(gtk::Orientation::Vertical, 10)
@@ -986,10 +1223,34 @@ fn picker_button(
     action: Action,
     save: bool,
 ) {
+    picker_dynamic(
+        container,
+        title,
+        window,
+        sender,
+        move || Ok(action.clone()),
+        save,
+    );
+}
+fn picker_dynamic(
+    container: &gtk::Box,
+    title: &str,
+    window: &gtk::ApplicationWindow,
+    sender: ComponentSender<App>,
+    action: impl Fn() -> anyhow::Result<Action> + 'static,
+    save: bool,
+) {
     let button = gtk::Button::with_label(title);
     let window = window.clone();
     let title = title.to_owned();
     button.connect_clicked(move |_| {
+        let action = match action() {
+            Ok(action) => action,
+            Err(e) => {
+                sender.input(Msg::Error(e.to_string()));
+                return;
+            }
+        };
         let dialog = gtk::FileChooserNative::new(
             Some(&title),
             Some(&window),
@@ -1001,52 +1262,135 @@ fn picker_button(
             Some(if save { "Save" } else { "Open" }),
             Some("Cancel"),
         );
+        dialog.set_modal(true);
         let sender = sender.clone();
-        let action = action.clone();
         dialog.connect_response(move |dialog, response| {
-            if response == gtk::ResponseType::Accept {
-                if let Some(path) = dialog.file().and_then(|file| file.path()) {
-                    let action = match &action {
-                        Action::StartRecording { .. } => Action::StartRecording { path },
-                        Action::OpenRecording { recover, .. } => Action::OpenRecording {
-                            path,
-                            recover: *recover,
-                        },
-                        Action::Export {
-                            format,
-                            table,
-                            redaction,
-                            ..
-                        } => Action::Export {
-                            path,
-                            format: format.clone(),
-                            table: table.clone(),
-                            redaction: redaction.clone(),
-                        },
-                        Action::Compare {
-                            session, policy, ..
-                        } => Action::Compare {
-                            path,
-                            session: *session,
-                            policy: policy.clone(),
-                        },
-                        Action::SaveWorkspace { name, .. } => Action::SaveWorkspace {
-                            path,
-                            name: name.clone(),
-                        },
-                        Action::OpenWorkspace { .. } => Action::OpenWorkspace { path },
-                        Action::LoadPolicy { .. } => Action::LoadPolicy { path },
-                        Action::SavePolicy { .. } => Action::SavePolicy { path },
-                        _ => return,
-                    };
-                    sender.input(Msg::Action(action));
-                }
+            if response == gtk::ResponseType::Accept
+                && let Some(path) = dialog.file().and_then(|file| file.path())
+            {
+                let action = match &action {
+                    Action::RedactRecording { policy, .. } => Action::RedactRecording {
+                        path,
+                        policy: policy.clone(),
+                    },
+                    Action::StartRecording { .. } => Action::StartRecording { path },
+                    Action::OpenRecording { recover, .. } => Action::OpenRecording {
+                        path,
+                        recover: *recover,
+                    },
+                    Action::Export {
+                        format,
+                        table,
+                        redaction,
+                        ..
+                    } => Action::Export {
+                        path,
+                        format: format.clone(),
+                        table: table.clone(),
+                        redaction: redaction.clone(),
+                    },
+                    Action::Compare {
+                        session, policy, ..
+                    } => Action::Compare {
+                        path,
+                        session: *session,
+                        policy: policy.clone(),
+                    },
+                    Action::SaveWorkspace { name, .. } => Action::SaveWorkspace {
+                        path,
+                        name: name.clone(),
+                    },
+                    Action::OpenWorkspace { .. } => Action::OpenWorkspace { path },
+                    Action::LoadPolicy { .. } => Action::LoadPolicy { path },
+                    Action::SavePolicy { .. } => Action::SavePolicy { path },
+                    _ => return,
+                };
+                sender.input(Msg::Action(action));
             }
             dialog.destroy();
         });
         dialog.show();
     });
     container.append(&button);
+}
+fn redaction(
+    fields: &gtk::Entry,
+    paths: &gtk::CheckButton,
+    endpoints: &gtk::CheckButton,
+) -> RedactionPolicy {
+    RedactionPolicy {
+        fields: fields
+            .text()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        source_paths: paths.is_active(),
+        endpoints: endpoints.is_active(),
+    }
+}
+fn trend_chart(points: &[console_ui::analysis::TrendPoint], metric: &'static str) -> gtk::Box {
+    let container = vertical();
+    let units = if metric == "polls" {
+        "polls/s"
+    } else {
+        "ns/interval"
+    };
+    container.append(&label(&format!(
+        "{metric} · {units} · red marks indicate gaps"
+    )));
+    let area = gtk::DrawingArea::new();
+    area.set_content_height(180);
+    area.set_hexpand(true);
+    let points = points.to_vec();
+    area.set_draw_func(move |_, cr, width, height| {
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        let _ = cr.paint();
+        cr.set_source_rgb(0.1, 0.1, 0.1);
+        cr.move_to(42.0, 12.0);
+        cr.line_to(42.0, height as f64 - 26.0);
+        cr.line_to(width as f64 - 8.0, height as f64 - 26.0);
+        let _ = cr.stroke();
+        let value = |p: &console_ui::analysis::TrendPoint| match metric {
+            "busy" => p.busy_ns as f64,
+            "scheduled" => p.scheduled_ns as f64,
+            _ => p.polls_per_second,
+        };
+        let maximum = points.iter().map(&value).fold(1.0, f64::max);
+        let first = points.first().map_or(0, |p| p.now);
+        let end = points.last().map_or(first, |p| p.now);
+        let span = end.saturating_sub(first).max(1) as f64;
+        cr.set_font_size(10.0);
+        cr.move_to(45.0, 12.0);
+        let _ = cr.show_text(&format!("max {maximum:.2}"));
+        cr.move_to(45.0, height as f64 - 8.0);
+        let _ = cr.show_text(&format!("Producer time {first}–{end} ns"));
+        let mut drawing = false;
+        for p in &points {
+            let x = 42.0 + (p.now.saturating_sub(first) as f64 / span) * (width as f64 - 54.0);
+            let y = height as f64 - 26.0 - value(p) / maximum * (height as f64 - 45.0);
+            if p.gap {
+                let _ = cr.stroke();
+                cr.set_source_rgb(0.8, 0.0, 0.0);
+                cr.move_to(x, 20.0);
+                cr.line_to(x, height as f64 - 26.0);
+                let _ = cr.stroke();
+                drawing = false;
+            } else {
+                cr.set_source_rgb(0.2, 0.4, 0.8);
+                if drawing {
+                    cr.line_to(x, y);
+                } else {
+                    cr.move_to(x, y);
+                    drawing = true;
+                }
+            }
+        }
+        let _ = cr.stroke();
+    });
+    container.append(&area);
+    container
 }
 fn ns(value: u64) -> String {
     console_ui::model::format_ns(value)
@@ -1123,7 +1467,7 @@ fn resource_details(
     }
 }
 fn shlex_args(text: &str) -> anyhow::Result<Vec<String>> {
-    Ok(shlex::split(text).ok_or_else(|| anyhow::anyhow!("Unclosed quote in editor arguments"))?)
+    shlex::split(text).ok_or_else(|| anyhow::anyhow!("Unclosed quote in editor arguments"))
 }
 fn main() -> anyhow::Result<()> {
     let prefs = Preferences::load(&Preferences::path()?)?;

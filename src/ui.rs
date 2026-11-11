@@ -1,6 +1,6 @@
 use crate::{
     config::{Lint, Palette, Settings, validate_target},
-    model::{Distribution, Snapshot, TaskRow, TaskState, Timing, format_ns, percent},
+    model::{Distribution, Snapshot, TaskState, Timing, format_ns, percent},
     telemetry::{Command, ConnectionStatus, LiveState, Worker},
 };
 use anyhow::Result;
@@ -23,6 +23,7 @@ pub struct Launch {
     pub navigation: Option<(u64, crate::workspace::Selection)>,
     pub on_selection: Callback<Option<crate::workspace::Selection>>,
     pub on_query: Callback<String>,
+    pub on_target: Callback<String>,
     pub on_settings: Callback<Settings>,
     pub on_table: Callback<(String, crate::preferences::TablePreferences)>,
 }
@@ -35,6 +36,7 @@ impl PartialEq for Launch {
             && self.navigation == other.navigation
             && self.on_selection == other.on_selection
             && self.on_query == other.on_query
+            && self.on_target == other.on_target
             && self.on_settings == other.on_settings
             && self.on_table == other.on_table
     }
@@ -182,8 +184,7 @@ impl Component for Console {
             }
             Message::Connect => match validate_target(&self.endpoint) {
                 Ok(()) if self.live.status != ConnectionStatus::Offline => {
-                    self.worker
-                        .send(Command::Connect(self.endpoint.to_string()));
+                    context.input().on_target.call(self.endpoint.to_string());
                     self.settings.target = self.endpoint.to_string();
                     self.notice = None;
                 }
@@ -218,7 +219,6 @@ impl Component for Console {
                     self.parent = Screen::Resources;
                     self.selected = None;
                     self.sort = 3;
-                    self.search = Rc::from("");
                 }
                 (Screen::Resource(_), Some(id)) => {
                     if let Some(task) = self
@@ -398,7 +398,6 @@ impl Console {
             Screen::Tasks
         };
         self.selected = None;
-        self.search = Rc::from("");
         self.sort = if screen == Screen::Tasks { 5 } else { 0 };
         self.restore_sort();
     }
@@ -890,8 +889,14 @@ impl Console {
             back(context),
             title(&format!("{}  /  task {id}", task.name), 26.0).into(),
         ];
-        for lint in &task.warnings {
-            content.push(note(&lint_description(*lint, task)));
+        for evidence in crate::analysis::evidence(task, &self.settings) {
+            content.push(note(&format!(
+                "{}: observed {}; threshold {}. {}",
+                evidence.lint.name(),
+                evidence.measured,
+                evidence.threshold,
+                evidence.explanation
+            )));
         }
         content.push(
             Grid::new()
@@ -1251,15 +1256,6 @@ fn histogram(name: &str, distribution: Option<&Distribution>, no_colors: bool) -
         )));
     }
     card(name, StackPanel::new().spacing(8.0).children(children))
-}
-fn lint_description(lint: Lint, task: &TaskRow) -> String {
-    match lint {
-        Lint::SelfWakes => format!("self-wakes: {:.1}% of wakeups came from the task itself. Check for a busy-looping future.", task.self_wake_percent()),
-        Lint::LostWaker => "lost-waker: this idle task has no active wakers and may never make progress.".into(),
-        Lint::NeverYielded => "never-yielded: the first poll has run for at least one second without returning. Check for blocking work in async code.".into(),
-        Lint::LargeFuture => "large-future: this future occupies at least 1,024 bytes of stack space.".into(),
-        Lint::AutoBoxedFuture => "auto-boxed-future: Tokio boxed this future because of its original size.".into(),
-    }
 }
 fn help_view() -> View {
     ScrollViewer::new().content(StackPanel::new().spacing(16.0).children((

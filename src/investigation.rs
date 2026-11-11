@@ -13,6 +13,7 @@ use std::{
     fs::File,
     io::{BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -46,7 +47,7 @@ pub struct Recording {
     pub path: PathBuf,
     pub sessions: Vec<SessionInfo>,
     pub warnings: Vec<String>,
-    frames: Vec<Frame>,
+    frames: Arc<Vec<Frame>>,
     checkpoints: VecDeque<Checkpoint>,
 }
 pub(crate) fn read_frame(reader: &mut (impl Read + Seek)) -> Result<Option<(u8, Vec<u8>)>> {
@@ -82,7 +83,7 @@ impl Recording {
             path: path.to_owned(),
             sessions: vec![],
             warnings: vec![],
-            frames: vec![],
+            frames: Arc::new(vec![]),
             checkpoints: VecDeque::new(),
         };
         let mut session = 0;
@@ -161,7 +162,7 @@ impl Recording {
                 }
                 _ => bail!("Unknown recording frame type {kind}"),
             }
-            recording.frames.push(Frame {
+            Arc::get_mut(&mut recording.frames).unwrap().push(Frame {
                 offset,
                 kind,
                 time: frame_time,
@@ -173,6 +174,45 @@ impl Recording {
             );
         }
         Ok(recording)
+    }
+    /// Share the bounded frame index while keeping each seek's cache independent.
+    pub fn fork(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            sessions: self.sessions.clone(),
+            warnings: self.warnings.clone(),
+            frames: self.frames.clone(),
+            checkpoints: VecDeque::new(),
+        }
+    }
+    /// Build a bounded trend history in one streaming pass, without retaining a
+    /// full Snapshot for each update or seeking from the start for each point.
+    pub fn history(
+        &self,
+        session: usize,
+        cursor: u64,
+        settings: &Settings,
+    ) -> Result<crate::analysis::History> {
+        let mut history = crate::analysis::History::default();
+        let mut accumulator = Accumulator::default();
+        let mut reader = BufReader::new(File::open(&self.path)?);
+        let since = cursor.saturating_sub(900_000_000_000);
+        for frame in self
+            .frames
+            .iter()
+            .filter(|f| f.session == session && f.time <= cursor && f.kind == 1)
+        {
+            reader.seek(SeekFrom::Start(frame.offset))?;
+            let (_, bytes) = read_frame(&mut reader)?.context("Recording changed while reading")?;
+            accumulator.apply(Update::decode(bytes.as_slice())?);
+            if frame.time >= since {
+                history.push(
+                    session as u64 + 1,
+                    &Arc::new(accumulator.snapshot(&settings.warnings)),
+                );
+            }
+        }
+        Ok(history)
     }
     pub fn seek(&mut self, session: usize, cursor: u64, settings: &Settings) -> Result<Snapshot> {
         let info = self
