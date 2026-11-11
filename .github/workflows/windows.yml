@@ -1,9 +1,13 @@
 name: Verify and package native apps
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 jobs:
   core:
@@ -26,13 +30,20 @@ jobs:
           components: clippy
       - uses: ilammy/msvc-dev-cmd@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
+      - name: Build native development app and target
+        run: cargo build --locked --bin console-ui --example instrumented
+      - name: Exercise native development UI before packaging
+        shell: pwsh
+        run: |
+          ./scripts/smoke-windows.ps1 -Executable ./target/debug/console-ui.exe
+          Move-Item dist/smoke-native-recording.tcui dist/smoke-debug-recording.tcui
       - name: Create self-contained x64 package
         shell: pwsh
         run: ./scripts/package-windows.ps1
-      - name: Build instrumented target
-        run: cargo build --locked --example instrumented
       - name: Exercise packaged native UI
         shell: pwsh
         run: ./scripts/smoke-windows.ps1

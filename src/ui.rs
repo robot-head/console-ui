@@ -9,10 +9,15 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::{Duration, Instant},
 };
 use windows_reactor::*;
+
+static NEXT_CONSOLE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct Launch {
@@ -76,9 +81,11 @@ pub enum Message {
     Palette(Palette),
     Save,
     FocusSelection,
+    SelectionScrolled,
 }
 
 pub struct Console {
+    instance: u64,
     settings: Settings,
     worker: Arc<Worker>,
     live: LiveState,
@@ -130,6 +137,7 @@ impl Component for Console {
             navigation: 0,
             notified_selection: None,
             tables: input.tables.clone(),
+            instance: NEXT_CONSOLE.fetch_add(1, AtomicOrdering::Relaxed),
             selected_row: ElementRef::new(),
             focus_timer: None,
         };
@@ -170,10 +178,22 @@ impl Component for Console {
         let old_sort = (self.sort, self.descending);
         let focus_after = matches!(
             &message,
-            Message::Key(_) | Message::Sort(_) | Message::Invert | Message::Back
+            Message::Key(_)
+                | Message::Select(_)
+                | Message::Sort(_)
+                | Message::Invert
+                | Message::Back
         );
         match message {
+            Message::SelectionScrolled => {}
             Message::FocusSelection => {
+                if let Some(id) = self.selected {
+                    let row = self.row_automation_id(id);
+                    let _ = context.run_window(move |window| {
+                        crate::windows_scroll::request(window.as_raw() as usize, row);
+                        Message::SelectionScrolled
+                    });
+                }
                 let queued = self.selected_row.request_focus_result(|result| {
                     if !matches!(result, Ok(true)) {
                         eprintln!("Selected row focus: {result:?}");
@@ -396,6 +416,14 @@ impl Component for Console {
 }
 
 impl Console {
+    fn row_automation_id(&self, id: u64) -> String {
+        format!(
+            "console-{}-{}-{}-{id}",
+            self.instance,
+            self.live.session,
+            self.table_key()
+        )
+    }
     fn table_key(&self) -> &'static str {
         match self.screen {
             Screen::Resources => "resources",
@@ -906,6 +934,7 @@ impl Console {
                     keyed(
                         row.id,
                         ListBoxItem::new()
+                            .automation_id(self.row_automation_id(row.id))
                             .automation_name(description)
                             .tag(row.id.to_string())
                             .is_selected(self.selected == Some(row.id))

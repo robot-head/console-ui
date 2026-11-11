@@ -15,3 +15,6 @@ pub mod workspace;
 pub mod ui;
 #[cfg(windows)]
 pub mod windows_workbench;
+
+#[cfg(windows)]
+mod windows_scroll;

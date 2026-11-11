@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param([string]$Executable = "$PSScriptRoot/../dist/console-ui-win-x64/console-ui.exe")
 $ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Path "$PSScriptRoot/../dist" -Force | Out-Null
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing, System.Windows.Forms
 Add-Type @'
 using System;

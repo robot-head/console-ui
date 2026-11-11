@@ -42,6 +42,11 @@ ticket with `xcrun stapler staple 'Console UI.app'`, and verify using `codesign
 checksum after stapling. Signing identities/notarization credentials belong in the
 release environment; CI does not embed credentials or silently claim notarization.
 
+Windows row scrolling uses the system UI Automation ScrollItem API on a separate
+COM thread. Requests identify the current component/session/row and only scroll a
+still-selected item; queued key repeats coalesce. This supplies explicit scrolling
+while Reactor's public element references expose focus without bring-into-view.
+
 ## Release checks
 
 The native CI jobs build packages and run display-backed smoke coverage. Artifacts

@@ -41,6 +41,7 @@ tonic = { version = "0.14", features = ["transport"] }
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.17", default-features = false }
+windows = { version = "0.62", features = ["Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Variant", "Win32_System_Ole"] }
 windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "0cfb708054687e5bc32c596a98cfcf1395344eab" }
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 
