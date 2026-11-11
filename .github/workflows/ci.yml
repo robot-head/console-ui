@@ -23,6 +23,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s scripts/tests -v
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -39,6 +43,16 @@ jobs:
         with:
           components: clippy
       - uses: ilammy/msvc-dev-cmd@v1
+      - name: Check PowerShell syntax and Authenticode rejection policies
+        shell: pwsh
+        run: |
+          foreach ($file in Get-ChildItem scripts -Filter '*.ps1' -Recurse) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+          ./scripts/tests/test-windows-signatures.ps1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
@@ -86,6 +100,11 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Exercise notarization policy and private-key cleanup on macOS
+        run: python3 -m unittest discover -s scripts/tests -v
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

@@ -33,14 +33,12 @@ Rust background jobs. Closing the final window/quitting destroys workers and
 synchronizes active recordings. The bridge catches Rust panics and returns typed
 JSON action/view results with explicit string ownership (see include/console_ui.h).
 
-Development and preview packages are ad-hoc signed. For trusted distribution, use a Developer ID
-Application identity to sign the CLI, Rust library, and main executable with hardened
-runtime and timestamp, then sign the outer app. Submit the resulting ZIP using
-`xcrun notarytool submit --keychain-profile <profile> --wait`, staple the accepted
-ticket with `xcrun stapler staple 'Console UI.app'`, and verify using `codesign
---verify --deep --strict` and `spctl --assess --type execute`. Recreate the ZIP and
-checksum after stapling. Signing identities/notarization credentials belong in the
-release environment; CI does not embed credentials or silently claim notarization.
+Development and preview packages are ad-hoc signed. Signed releases use
+`bash scripts/package-macos.sh signed` to apply Developer ID signatures, hardened
+runtime, timestamps, notarization, stapling, and Gatekeeper verification before
+creating the final ZIP. Credentials are imported into a temporary keychain and
+removed on success or failure. See [signing setup](signing.md) for the required
+Apple credentials and exact verification steps.
 
 Windows row scrolling uses the system UI Automation ScrollItem API on a separate
 COM thread. Requests identify the current component/session/row and only scroll a
@@ -51,10 +49,11 @@ while Reactor's public element references expose focus without bring-into-view.
 
 CI runs development builds and display-backed native smoke tests. The release
 workflow builds and tests extracted distribution archives. Artifacts include ZIP/tar
-archives, checksums, provenance manifests, logs, and screenshots. Public release publication,
-trusted Windows signing, macOS notarization, and a clean Windows 11 VM distribution
-check are explicit release-operator steps; they do not change the product feature
-milestones. Preview packages are not installers/updaters.
+archives, checksums, source manifests, logs, and screenshots. Signed distributions
+also include Sigstore verification bundles. Windows signing and macOS notarization
+run automatically once providers are configured. Public publication and a clean
+Windows 11 VM distribution check remain release-operator steps. Preview packages
+are not installers/updaters.
 
 ## GitHub Actions
 
@@ -67,33 +66,40 @@ in release mode. Smoke evidence is retained for 14 days.
 
 [Release builds](../.github/workflows/release.yml) support:
 
-- A pushed `v<Cargo version>` tag: validate all application versions, run reusable CI,
-  build and smoke-test all three extracted archives, verify asset checksums, and
-  create or refresh a **draft** GitHub release. Reruns refuse to replace published
-  release assets. The tag must already exist and still reference the built commit.
-- Manual dispatch: run the same checks and packaging, retaining download artifacts
-  for 30 days. A branch run produces preview artifacts; dispatching an existing
-  version tag also stages its draft release.
+- A pushed `v<Cargo version>` tag: validate versions, run reusable CI, sign and
+  smoke-test all three extracted archives, independently verify signatures and
+  checksums, and stage a **draft** GitHub release. Missing signing configuration
+  fails the build. Reruns refuse to replace published assets. The tag must already
+  exist and still reference the built commit.
+- Manual dispatch defaults to `distribution=signed`, using `master` or a matching
+  version tag. `distribution=preview` explicitly builds unsigned development
+  artifacts on a branch, without secrets or OIDC permissions. Tag builds always
+  require signing. Artifacts are retained for 30 days.
 - PRs changing workflows, native packaging, or smoke scripts: build/test previews
   alongside normal CI, without creating a tag or GitHub release.
 
 The root and GTK `Cargo.toml` versions and both macOS bundle version fields must
-match. Update them together before tagging. For example, after merging the workflows:
+match, including the workspace lockfile. Configure the [release-signing environment
+and providers](signing.md) first. For example, after merging and updating versions:
 
 ```sh
-gh workflow run release.yml --ref master
-# When releasing version 0.1.0 from the intended, reviewed commit:
-git tag v0.1.0 <commit>
-git push origin v0.1.0
+gh workflow run release.yml --ref master -f distribution=signed
+# After updating application versions to 0.1.1 in the intended, reviewed commit:
+git tag v0.1.1 <commit>
+git push origin v0.1.1
 ```
 
 Release archives are named `console-ui-<version>-windows-x64.zip`,
 `console-ui-<version>-linux-x86_64.tar.gz`, and
 `console-ui-<version>-macos-arm64.zip`. Each has a `.sha256` sidecar and a JSON
 manifest with schema version, application version, platform, source commit, archive
-name, and SHA-256 digest. Only the draft-release job receives `contents: write`;
-build and verification jobs use read access. Production releases require the release
-operator's signing/notarization and clean-machine checks before publication. Preview
-releases must identify unsigned or ad-hoc-signed builds and any pending platform checks
-in their release notes. If signing changes an archive, regenerate its checksum and
-manifest before uploading it.
+name, SHA-256 digest, distribution mode, and expected signing identity. Signed
+manifests include native verification evidence for Windows/macOS. Every archive,
+checksum, and manifest has a `.sigstore.json` signature bundle (18 assets total).
+Only the draft-release job receives `contents: write`; only signed package jobs
+receive release credentials and `id-token: write`. Independent asset verification
+uses read access and pins the workflow/ref identity, repository, and source commit.
+See [consumer verification commands](signing.md#4-linux-and-archive-authenticity-sigstore).
+
+Published `v0.1.0` remains an unsigned/ad-hoc-signed preview. Enable signed
+distribution for a new version rather than replacing published download bytes.

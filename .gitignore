@@ -2,3 +2,4 @@
 /dist
 *.tcui
 /console.toml
+__pycache__/

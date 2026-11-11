@@ -293,10 +293,12 @@ formatting, Clippy, all Rust tests, and native Windows, GTK X11/Wayland, and mac
 smoke tests. Smoke logs, recordings, and screenshots are retained for 14 days.
 
 [Release builds](.github/workflows/release.yml) run on `v*` tags or manual dispatch.
-They validate versions, run CI, build and test extracted native archives, and upload
-versioned packages, SHA-256 checksums, and source manifests for all three platforms.
-Tag builds stage a draft GitHub release. PRs changing build/workflow files also run
-packaging previews. See [release operation](docs/distribution.md#github-actions).
+They validate versions, run CI, build and test extracted native archives, and require
+Windows Authenticode signatures, macOS Developer ID signing/notarization, and Sigstore
+signatures on the final archives, checksums, and source manifests. Tag builds stage a
+verified draft GitHub release. PRs run credential-free packaging previews; manual
+dispatch offers signed builds or explicit previews. Configure the providers using
+[signed distribution setup](docs/signing.md) before the next version tag.
 
-Product feature tracking is in [the roadmap](docs/roadmap.md). Public signing and
-notarization remain release-operator steps.
+Product feature tracking is in [the roadmap](docs/roadmap.md). Production publication
+and clean-machine distribution checks remain release-operator steps.
