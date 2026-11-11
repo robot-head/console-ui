@@ -367,6 +367,7 @@ impl Preferences {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectPolicy {
     pub schema_version: u32,
     pub settings: Option<Settings>,

@@ -75,6 +75,7 @@ pub enum Message {
     WarningsOnly(bool),
     Palette(Palette),
     Save,
+    FocusSelection,
 }
 
 pub struct Console {
@@ -98,6 +99,8 @@ pub struct Console {
     navigation: u64,
     notified_selection: Option<crate::workspace::Selection>,
     tables: BTreeMap<String, crate::preferences::TablePreferences>,
+    selected_row: ElementRef<Border>,
+    focus_timer: Option<ComponentTimer>,
 }
 
 impl Component for Console {
@@ -127,6 +130,8 @@ impl Component for Console {
             navigation: 0,
             notified_selection: None,
             tables: input.tables.clone(),
+            selected_row: ElementRef::new(),
+            focus_timer: None,
         };
         result.input_changed(input, context);
         result
@@ -163,7 +168,14 @@ impl Component for Console {
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         let old_sort = (self.sort, self.descending);
+        let focus_after = matches!(
+            &message,
+            Message::Key(_) | Message::Sort(_) | Message::Invert | Message::Back
+        );
         match message {
+            Message::FocusSelection => {
+                let _ = self.selected_row.request_focus();
+            }
             Message::Tick => {
                 let next = self.worker.read();
                 if next.session != self.live.session {
@@ -208,10 +220,7 @@ impl Component for Console {
             Message::Resources => self.navigate(Screen::Resources),
             Message::Settings => self.navigate(Screen::Settings),
             Message::Help => self.navigate(Screen::Help),
-            Message::Back => {
-                let parent = self.parent;
-                self.navigate(parent);
-            }
+            Message::Back => self.back(),
             Message::Inspect => match (self.screen, self.selected) {
                 (Screen::Tasks, Some(id)) => self.open_task(id),
                 (Screen::Resources, Some(id)) => {
@@ -276,6 +285,17 @@ impl Component for Console {
                 self.notice = Some("Settings saved to your application preferences".into());
             }
             Message::Key(event) => self.key(event, context),
+        }
+        if focus_after
+            && self.selected.is_some()
+            && matches!(
+                self.screen,
+                Screen::Tasks | Screen::Resources | Screen::Resource(_)
+            )
+        {
+            self.focus_timer = Some(
+                context.set_local_timeout(Duration::from_millis(30), || Message::FocusSelection),
+            );
         }
         let selection = match self.screen {
             Screen::Task(id) => Some(("task", id)),
@@ -410,6 +430,17 @@ impl Console {
         self.screen = Screen::Task(id);
         self.worker.send(Command::Inspect(Some(id)));
     }
+    fn back(&mut self) {
+        let selected = match (self.screen, self.parent) {
+            (Screen::Task(id), Screen::Tasks) | (Screen::Resource(id), Screen::Resources) => {
+                Some(id)
+            }
+            (Screen::Task(_), Screen::Resource(_)) => self.selected,
+            _ => None,
+        };
+        self.navigate(self.parent);
+        self.selected = selected;
+    }
     fn key(&mut self, event: KeyEventInfo, context: &ComponentContext<Self>) {
         match event.key {
             VirtualKey::T => self.navigate(Screen::Tasks),
@@ -417,10 +448,7 @@ impl Console {
             VirtualKey::Q => {
                 let _ = context.close_window();
             }
-            VirtualKey::ESCAPE => {
-                let parent = self.parent;
-                self.navigate(parent);
-            }
+            VirtualKey::ESCAPE => self.back(),
             VirtualKey::SPACE => self.update(Message::Pause, context),
             VirtualKey::ENTER => self.update(Message::Inspect, context),
             VirtualKey::I => self.descending = !self.descending,
@@ -845,27 +873,34 @@ impl Console {
                         .map(|c| c.text.as_str())
                         .collect::<Vec<_>>()
                         .join("  ");
-                    DataItem::new(row.id, description).content(
-                        Grid::new()
-                            .width(width)
-                            .columns(columns.clone())
-                            .column_spacing(4.0)
-                            .children(
-                                visible
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(display, (index, _))| {
-                                        TextBlock::new()
-                                            .grid_column(display as i32)
-                                            .text(row.cells[*index].text.clone())
-                                            .font_size(12.0)
-                                            .text_trimming(TextTrimming::CharacterEllipsis)
-                                            .margin(Thickness::xy(2.0, 8.0))
-                                            .into()
-                                    })
-                                    .collect::<Vec<View>>(),
-                            ),
-                    )
+                    let description = format!("ID {}, {description}", row.id);
+                    let content = Grid::new()
+                        .width(width)
+                        .columns(columns.clone())
+                        .column_spacing(4.0)
+                        .children(
+                            visible
+                                .iter()
+                                .enumerate()
+                                .map(|(display, (index, _))| {
+                                    TextBlock::new()
+                                        .grid_column(display as i32)
+                                        .text(row.cells[*index].text.clone())
+                                        .font_size(12.0)
+                                        .text_trimming(TextTrimming::CharacterEllipsis)
+                                        .margin(Thickness::xy(2.0, 8.0))
+                                        .into()
+                                })
+                                .collect::<Vec<View>>(),
+                        );
+                    let frame = Border::new()
+                        .is_tab_stop(self.selected == Some(row.id))
+                        .content(content);
+                    DataItem::new(row.id, description).content(if self.selected == Some(row.id) {
+                        frame.element_ref(&self.selected_row)
+                    } else {
+                        frame
+                    })
                 }))
                 .into()
         };

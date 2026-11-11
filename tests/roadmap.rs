@@ -873,3 +873,56 @@ fn project_policy_and_cli_overrides_use_the_same_headless_thresholds() {
     assert_eq!(loaded.lint_thresholds.self_wake_percent, 90);
     assert_eq!(loaded.retain_for, "none");
 }
+
+#[test]
+fn path_redaction_covers_formatted_attributes_and_policy_query_metadata() {
+    let mut snapshot = sample(101, 1, 1);
+    snapshot.resources.push(console_ui::model::ResourceRow {
+        id: 9,
+        kind: "Sync".into(),
+        concrete_type: "Mutex".into(),
+        target: String::new(),
+        location: "/private/project.rs:1:1".into(),
+        attributes: "loc.file=/private/project.rs".into(),
+        internal: false,
+        parent: None,
+        total: 1,
+        completed: false,
+    });
+    let policy = RedactionPolicy {
+        source_paths: true,
+        ..Default::default()
+    };
+    let redacted = policy.document(&ExportDocument::new(1, None, snapshot));
+    assert!(
+        !serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("/private/project.rs")
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original.tcui");
+    let copy = directory.path().join("copy.tcui");
+    let mut recorder = Recorder::create(&original).unwrap();
+    recorder.session("http://localhost:6669").unwrap();
+    recorder
+        .histogram_policy(
+            "http://localhost:6669",
+            &HistogramPolicy {
+                mode: "matching".into(),
+                query: "source:/private/project.rs".into(),
+                ..Default::default()
+            },
+            "/private/project.rs",
+        )
+        .unwrap();
+    recorder.update(&update(101, 1, 1, "worker")).unwrap();
+    recorder.flush().unwrap();
+    drop(recorder);
+    policy.recording_copy(&original, &copy).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&std::fs::read(&copy).unwrap()).contains("/private/project.rs")
+    );
+    assert!(
+        String::from_utf8_lossy(&std::fs::read(&original).unwrap()).contains("/private/project.rs")
+    );
+}

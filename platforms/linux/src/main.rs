@@ -95,7 +95,6 @@ impl SimpleComponent for App {
         let status = label("Connecting…");
         outer.append(&status);
         let error = label("");
-        error.add_css_class("error");
         outer.append(&error);
         let tabs = horizontal();
         outer.append(&tabs);

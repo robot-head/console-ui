@@ -343,7 +343,7 @@ impl RedactionPolicy {
         }
         // Attribute strings do not preserve their field structure in old snapshots. Remove them
         // conservatively whenever field redaction is requested.
-        if !self.fields.is_empty() {
+        if !self.fields.is_empty() || self.source_paths {
             for r in &mut result.snapshot.resources {
                 r.attributes = "[redacted]".into();
             }
@@ -355,8 +355,7 @@ impl RedactionPolicy {
             }
         }
         if self.source_paths || self.endpoints || !self.fields.is_empty() {
-            result.notes =
-                vec!["Export redacted with an explicit field/path/endpoint policy.".into()];
+            result.notes = vec!["Export redacted with an explicit field/path/endpoint policy.".into(),"Counters are lifetime values at the cursor; chart ranges do not change table scope. Missing histograms and dropped events are incomplete evidence.".into()];
         }
         result
     }

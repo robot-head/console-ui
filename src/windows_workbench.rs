@@ -510,9 +510,10 @@ impl Workbench {
             "editor" => {
                 let mut prefs = self.app.preferences.editor.clone();
                 prefs.program = self.value("editor_program", &prefs.program);
-                prefs.arguments = shlex::split(
-                    &self.value("editor_arguments", "--goto '{file}:{line}:{column}'"),
-                )
+                prefs.arguments = shlex::split(&self.value(
+                    "editor_arguments",
+                    &shlex::try_join(prefs.arguments.iter().map(String::as_str))?,
+                ))
                 .context("Editor arguments contain an unclosed quote")?;
                 Action::Editor { preferences: prefs }
             }
@@ -852,7 +853,7 @@ impl Workbench {
             self.entry(
                 "editor_arguments",
                 "Arguments ({file}, {line}, {column}); quote arguments containing spaces",
-                "--goto '{file}:{line}:{column}'",
+                &shlex::try_join(editor.arguments.iter().map(String::as_str)).unwrap_or_default(),
                 c,
             ),
             button("Save editor integration", c, Message::Apply("editor")),

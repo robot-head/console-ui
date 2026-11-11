@@ -44,6 +44,9 @@ jobs:
             dist/*.zip
             dist/*.sha256
             dist/smoke-*.png
+            dist/smoke-*.log
+            dist/smoke-*.tcui
+            dist/smoke-*.json
           if-no-files-found: error
   linux-native:
     runs-on: ubuntu-24.04

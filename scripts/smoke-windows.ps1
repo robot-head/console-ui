@@ -57,6 +57,20 @@ try {
     $itemCondition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)
     $first = Wait-For { $table.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $itemCondition) } 'task row'
     $first.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $firstId = $first.Current.Name.Split(',')[0]
+    $script:root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern).Resize(1180, 780)
+    $table.SetFocus()
+    [System.Windows.Forms.SendKeys]::SendWait('{END}')
+    Wait-For {
+        $selected = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).GetCurrentSelection()
+        $selected.Count -eq 1 -and $selected[0].Current.Name.Split(',')[0] -ne $firstId -and -not $selected[0].Current.IsOffscreen
+    } 'keyboard-selected final row visible after scrolling' | Out-Null
+    Capture 'keyboard-selection'
+    [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
+    Wait-For {
+        $selected = $table.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).GetCurrentSelection()
+        $selected.Count -eq 1 -and -not $selected[0].Current.IsOffscreen
+    } 'keyboard-selected first row visible' | Out-Null
     Invoke-Name 'Inspect selected'
     Wait-For { Find-Name 'Waker activity' } 'task details' | Out-Null
     Capture 'task-details'
@@ -89,8 +103,10 @@ try {
     if (-not $app.WaitForExit(10000)) { throw 'Native window did not shut down cleanly' }
     if ($app.ExitCode -ne 0) { throw "Native shutdown failed with $($app.ExitCode)" }
     $replay = "$PSScriptRoot/../dist/smoke-native-replay.json"
-    & $Executable --replay $capture dump --output $replay
-    if ($LASTEXITCODE -ne 0) { throw 'Shutdown recording could not be replayed' }
+    if (-not (Test-Path $capture)) { throw 'Native recording file was not created' }
+    $replayError = "$PSScriptRoot/../dist/smoke-native-replay-error.log"
+    $replayProcess = Start-Process (Resolve-Path $Executable) -ArgumentList @('--replay', $capture, 'dump', '--output', $replay) -Wait -PassThru -RedirectStandardError $replayError
+    if ($replayProcess.ExitCode -ne 0) { throw "Shutdown recording could not be replayed ($($replayProcess.ExitCode)): $(Get-Content $replayError -Raw)" }
     $snapshot = Get-Content $replay -Raw | ConvertFrom-Json
     if ($snapshot.tasks.Count -lt 1) { throw 'Shutdown recording lost its task data' }
     Write-Output 'Packaged app inspected tasks/resources, filtered a task, rendered analysis, paused/resumed, and flushed a replayable capture on native window close.'

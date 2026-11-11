@@ -214,6 +214,11 @@ pub enum Action {
     Editor {
         preferences: EditorPreferences,
     },
+    EditorCommand {
+        program: String,
+        arguments: String,
+        mappings: Vec<preferences::PathMapping>,
+    },
     OpenSource,
     Thresholds {
         thresholds: LintThresholds,
@@ -1059,6 +1064,21 @@ impl Workspace {
                 preferences.validate()?;
                 self.preferences.editor = preferences;
                 self.persist()?;
+            }
+            Action::EditorCommand {
+                program,
+                arguments,
+                mappings,
+            } => {
+                let arguments = shlex::split(&arguments)
+                    .context("Editor arguments contain an unclosed quote")?;
+                self.dispatch(Action::Editor {
+                    preferences: EditorPreferences {
+                        program,
+                        arguments,
+                        mappings,
+                    },
+                })?;
             }
             Action::OpenSource => {
                 let tab = self.current();

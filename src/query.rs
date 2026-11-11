@@ -64,6 +64,7 @@ impl Query {
                     (operator == '=', &rest[1..])
                 };
                 ensure!(!value.is_empty(), "Filter {field} needs a value");
+                ensure!(field != "field.", "A span-field filter needs a field key");
                 let number = if ["busy", "scheduled", "sched", "idle", "total"].contains(&field) {
                     humantime::parse_duration(value)?.as_nanos().try_into()?
                 } else if field == "size" {
@@ -107,6 +108,7 @@ impl Query {
                     "Unknown filter {field}"
                 );
                 ensure!(!value.is_empty(), "Filter {field} needs a value");
+                ensure!(field != "field.", "A span-field filter needs a field key");
                 (field.into(), Operation::Contains(value.to_lowercase()))
             } else {
                 ("text".into(), Operation::Contains(token.to_lowercase()))
