@@ -6,7 +6,7 @@ use crate::{
 use anyhow::Result;
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::BTreeMap,
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -16,12 +16,27 @@ use windows_reactor::*;
 
 #[derive(Clone)]
 pub struct Launch {
-    settings: Settings,
-    worker: Arc<Worker>,
+    pub settings: Settings,
+    pub worker: Arc<Worker>,
+    pub query: String,
+    pub tables: BTreeMap<String, crate::preferences::TablePreferences>,
+    pub navigation: Option<(u64, crate::workspace::Selection)>,
+    pub on_selection: Callback<Option<crate::workspace::Selection>>,
+    pub on_query: Callback<String>,
+    pub on_settings: Callback<Settings>,
+    pub on_table: Callback<(String, crate::preferences::TablePreferences)>,
 }
 impl PartialEq for Launch {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.worker, &other.worker)
+            && self.settings == other.settings
+            && self.query == other.query
+            && self.tables == other.tables
+            && self.navigation == other.navigation
+            && self.on_selection == other.on_selection
+            && self.on_query == other.on_query
+            && self.on_settings == other.on_settings
+            && self.on_table == other.on_table
     }
 }
 
@@ -77,6 +92,10 @@ pub struct Console {
     warnings_only: bool,
     last_g: Option<Instant>,
     notice: Option<String>,
+    external_query: String,
+    navigation: u64,
+    notified_selection: Option<crate::workspace::Selection>,
+    tables: BTreeMap<String, crate::preferences::TablePreferences>,
 }
 
 impl Component for Console {
@@ -85,7 +104,7 @@ impl Component for Console {
 
     fn create(input: &Launch, context: &ComponentContext<Self>) -> Self {
         let live = input.worker.read();
-        Self {
+        let mut result = Self {
             settings: input.settings.clone(),
             worker: Arc::clone(&input.worker),
             snapshot: Arc::clone(&live.snapshot),
@@ -94,7 +113,7 @@ impl Component for Console {
             screen: Screen::Tasks,
             parent: Screen::Tasks,
             endpoint: Rc::from(input.settings.target.as_str()),
-            search: Rc::from(""),
+            search: Rc::from(input.query.as_str()),
             selected: None,
             sort: 5,
             descending: true,
@@ -102,10 +121,46 @@ impl Component for Console {
             warnings_only: false,
             last_g: None,
             notice: None,
+            external_query: input.query.clone(),
+            navigation: 0,
+            notified_selection: None,
+            tables: input.tables.clone(),
+        };
+        result.input_changed(input, context);
+        result
+    }
+
+    fn input_changed(&mut self, input: &Launch, _: &ComponentContext<Self>) {
+        self.settings = input.settings.clone();
+        self.tables = input.tables.clone();
+        self.restore_sort();
+        if self.external_query != input.query {
+            self.external_query = input.query.clone();
+            self.search = Rc::from(input.query.as_str());
+            self.selected = None;
+        }
+        if let Some((sequence, selection)) = &input.navigation
+            && *sequence != self.navigation
+            && selection.session == self.live.session
+        {
+            self.navigation = *sequence;
+            match selection.kind.as_str() {
+                "task" => {
+                    self.screen = Screen::Task(selection.id);
+                    self.parent = Screen::Tasks;
+                    self.worker.send(Command::Inspect(Some(selection.id)));
+                }
+                "resource" => {
+                    self.screen = Screen::Resource(selection.id);
+                    self.parent = Screen::Resources;
+                }
+                _ => {}
+            }
         }
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
+        let old_sort = (self.sort, self.descending);
         match message {
             Message::Tick => {
                 let next = self.worker.read();
@@ -139,6 +194,13 @@ impl Component for Console {
             Message::Search(value) => {
                 self.search = value;
                 self.selected = None;
+                match crate::query::Query::parse(&self.search) {
+                    Ok(_) => {
+                        context.input().on_query.call(self.search.to_string());
+                        self.notice = None;
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
             }
             Message::Select(id) => self.selected = id,
             Message::Tasks => self.navigate(Screen::Tasks),
@@ -203,32 +265,53 @@ impl Component for Console {
                     task.lint(&self.settings.warnings);
                 }
                 self.snapshot = Arc::new(snapshot);
+                context.input().on_settings.call(self.settings.clone());
             }
-            Message::Palette(palette) => self.settings.palette = palette,
+            Message::Palette(palette) => {
+                self.settings.palette = palette;
+                context.input().on_settings.call(self.settings.clone());
+            }
             Message::Save => {
-                self.notice = Some(
-                    match toml::to_string_pretty(&self.settings)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|text| {
-                            std::fs::write("console.toml", text).map_err(anyhow::Error::from)
-                        }) {
-                        Ok(()) => "Settings saved to console.toml in the current directory".into(),
-                        Err(error) => format!("Could not save settings: {error}"),
-                    },
-                );
+                context.input().on_settings.call(self.settings.clone());
+                self.notice = Some("Settings saved to your application preferences".into());
             }
             Message::Key(event) => self.key(event, context),
+        }
+        let selection = match self.screen {
+            Screen::Task(id) => Some(("task", id)),
+            Screen::Resource(id) => Some(("resource", id)),
+            Screen::Tasks => self.selected.map(|id| ("task", id)),
+            Screen::Resources => self.selected.map(|id| ("resource", id)),
+            _ => None,
+        }
+        .map(|(kind, id)| crate::workspace::Selection {
+            kind: kind.into(),
+            id,
+            session: self.live.session,
+        });
+        if selection != self.notified_selection {
+            self.notified_selection = selection.clone();
+            context.input().on_selection.call(selection);
+        }
+        if old_sort != (self.sort, self.descending)
+            && matches!(
+                self.screen,
+                Screen::Tasks | Screen::Resources | Screen::Resource(_)
+            )
+        {
+            let key = self.table_key().to_owned();
+            let mut preferences = self.tables.get(&key).cloned().unwrap_or_default();
+            preferences.sort = self
+                .headers()
+                .get(self.sort)
+                .unwrap_or(&"ID")
+                .to_lowercase();
+            preferences.descending = self.descending;
+            context.input().on_table.call((key, preferences));
         }
     }
 
     fn view(&self, _: &Launch, context: &mut ViewContext<Self>) -> View {
-        context.window_visuals(WindowVisuals::new().client_size(1480.0, 920.0).theme(
-            match self.settings.palette {
-                Palette::System => WindowTheme::System,
-                Palette::Dark => WindowTheme::Dark,
-                Palette::Light => WindowTheme::Light,
-            },
-        ));
         let sender = context.sender();
         let editing = self.editing;
         let keys = RoutedCallback::new(move |event: KeyEventInfo| {
@@ -283,11 +366,29 @@ impl Component for Console {
                     TextBlock::new().grid_row(3).font_size(12.0).opacity(0.75)
                         .text("t Tasks   r Resources   j/k Move   h/l Sort   i Invert   Enter Inspect   Esc Back   Space Pause   q Quit"),
                 )));
-        context.window_frame("Console UI  /  Tokio diagnostics", frame)
+        frame.into()
     }
 }
 
 impl Console {
+    fn table_key(&self) -> &'static str {
+        match self.screen {
+            Screen::Resources => "resources",
+            Screen::Resource(_) => "operations",
+            _ => "tasks",
+        }
+    }
+    fn restore_sort(&mut self) {
+        if let Some(p) = self.tables.get(self.table_key())
+            && let Some(index) = self
+                .headers()
+                .iter()
+                .position(|h| h.eq_ignore_ascii_case(&p.sort))
+        {
+            self.sort = index;
+            self.descending = p.descending;
+        }
+    }
     fn navigate(&mut self, screen: Screen) {
         self.worker.send(Command::Inspect(None));
         self.screen = screen;
@@ -299,6 +400,7 @@ impl Console {
         self.selected = None;
         self.search = Rc::from("");
         self.sort = if screen == Screen::Tasks { 5 } else { 0 };
+        self.restore_sort();
     }
     fn open_task(&mut self, id: u64) {
         self.parent = if matches!(self.screen, Screen::Resource(_)) {
@@ -498,12 +600,16 @@ impl Console {
         }
     }
     fn rows(&self) -> Vec<Row> {
-        let query = self.search.to_lowercase();
+        let query = match crate::query::Query::parse(&self.search) {
+            Ok(q) => q,
+            Err(_) => return vec![],
+        };
         let mut rows: Vec<Row> = match self.screen {
             Screen::Resources => self
                 .snapshot
                 .resources
                 .iter()
+                .filter(|r| query.resource(r))
                 .map(|r| Row {
                     id: r.id,
                     cells: vec![
@@ -523,6 +629,7 @@ impl Console {
                 .async_ops
                 .iter()
                 .filter(|o| o.resource_id == id)
+                .filter(|o| query.operation(o))
                 .map(|o| Row {
                     id: o.id,
                     cells: vec![
@@ -555,6 +662,7 @@ impl Console {
                 .tasks
                 .iter()
                 .filter(|t| !self.warnings_only || !t.warnings.is_empty())
+                .filter(|t| query.task(t))
                 .map(|t| Row {
                     id: t.id,
                     cells: vec![
@@ -582,19 +690,6 @@ impl Console {
                 })
                 .collect(),
         };
-        let field_matches: BTreeSet<_> = self
-            .snapshot
-            .tasks
-            .iter()
-            .filter(|t| self.screen == Screen::Tasks && t.fields.to_lowercase().contains(&query))
-            .map(|t| t.id)
-            .collect();
-        rows.retain(|r| {
-            r.cells
-                .iter()
-                .any(|c| c.text.to_lowercase().contains(&query))
-                || field_matches.contains(&r.id)
-        });
         rows.sort_by(|a, b| {
             let order = a
                 .cells
@@ -664,7 +759,9 @@ impl Console {
             .content(
                 TextBox::new()
                     .text(self.search.clone())
-                    .placeholder_text("Filter by name, ID, target, source, or fields...")
+                    .placeholder_text(
+                        "Filter: name:worker busy>5ms !state:completed | warning:self-wakes",
+                    )
                     .automation_name("Filter telemetry")
                     .on_text_changed(context.callback(Message::Search)),
             )
@@ -677,88 +774,112 @@ impl Console {
         let selected_index = self
             .selected
             .and_then(|id| ids.iter().position(|v| *v == id));
-        let columns: Vec<_> = self
-            .headers()
+        let preferences = self
+            .tables
+            .get(self.table_key())
+            .cloned()
+            .unwrap_or_default();
+        let configured = if preferences.columns.is_empty() {
+            crate::preferences::default_columns(self.table_key())
+        } else {
+            preferences.columns
+        };
+        let visible: Vec<_> = configured
             .iter()
-            .enumerate()
-            .map(|(i, _)| match (self.screen, i) {
-                (Screen::Tasks, 2 | 9 | 10)
-                | (Screen::Resources, 2 | 5 | 6 | 7)
-                | (Screen::Resource(_), 1 | 2 | 8) => GridLength::Star(2.0),
-                _ => GridLength::STAR,
-            })
-            .collect();
-        let headers = Grid::new()
-            .columns(columns.clone())
-            .column_spacing(4.0)
-            .children(
+            .filter(|c| c.visible)
+            .filter_map(|c| {
                 self.headers()
                     .iter()
+                    .position(|h| h.eq_ignore_ascii_case(&c.key))
+                    .map(|index| (index, c.width))
+            })
+            .collect();
+        let columns: Vec<_> = visible
+            .iter()
+            .map(|(_, width)| GridLength::Pixel(*width))
+            .collect();
+        let width =
+            visible.iter().map(|(_, width)| *width).sum::<f64>() + 4.0 * visible.len() as f64;
+        let headers = Grid::new()
+            .width(width)
+            .columns(columns.clone())
+            .column_spacing(4.0)
+            .margin(Thickness::new(12.0, 0.0, 12.0, 0.0))
+            .children(
+                visible
+                    .iter()
                     .enumerate()
-                    .map(|(i, name)| {
+                    .map(|(display, (index, _))| {
                         Button::new()
-                            .grid_column(i as i32)
+                            .grid_column(display as i32)
                             .style(ButtonStyle::Subtle)
                             .content(format!(
-                                "{name}{}",
-                                if i == self.sort {
+                                "{}{}",
+                                self.headers()[*index],
+                                if *index == self.sort {
                                     if self.descending { " v" } else { " ^" }
                                 } else {
                                     ""
                                 }
                             ))
-                            .on_click(context.message(Message::Sort(i)))
+                            .on_click(context.message(Message::Sort(*index)))
                             .into()
                     })
                     .collect::<Vec<View>>(),
             );
-        let table: View =
-            if rows.is_empty() {
-                card("No matching telemetry", StackPanel::new().spacing(8.0).children((
+        let table: View = if rows.is_empty() {
+            card(
+                "No matching telemetry",
                 "Start an instrumented application, check the endpoint, or clear the filter.",
-                "The Help tab includes the instrumentation setup and keyboard shortcuts.",
-            )))
-            } else {
-                ListView::new()
-                    .selected_index(selected_index)
-                    .automation_name("Live telemetry table")
-                    .on_selection_changed(context.callback(move |index: Option<usize>| {
-                        Message::Select(index.and_then(|i| ids.get(i).copied()))
-                    }))
-                    .items(rows.into_iter().map(|row| {
-                        let description = row
-                            .cells
-                            .iter()
-                            .map(|c| c.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("  ");
-                        DataItem::new(row.id, description).content(
-                            Grid::new()
-                                .columns(columns.clone())
-                                .column_spacing(4.0)
-                                .children(
-                                    row.cells
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(i, cell)| {
-                                            TextBlock::new()
-                                                .grid_column(i as i32)
-                                                .text(cell.text)
-                                                .font_size(12.0)
-                                                .text_trimming(TextTrimming::CharacterEllipsis)
-                                                .margin(Thickness::xy(2.0, 8.0))
-                                                .into()
-                                        })
-                                        .collect::<Vec<View>>(),
-                                ),
-                        )
-                    }))
-                    .into()
-            };
-        Grid::new()
-            .rows([GridLength::Auto, GridLength::STAR])
-            .row_spacing(6.0)
-            .children((headers, Border::new().grid_row(1).content(table)))
+            )
+        } else {
+            ListView::new()
+                .selected_index(selected_index)
+                .automation_name("Live telemetry table")
+                .on_selection_changed(context.callback(move |index: Option<usize>| {
+                    Message::Select(index.and_then(|i| ids.get(i).copied()))
+                }))
+                .items(rows.into_iter().map(|row| {
+                    let description = row
+                        .cells
+                        .iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    DataItem::new(row.id, description).content(
+                        Grid::new()
+                            .width(width)
+                            .columns(columns.clone())
+                            .column_spacing(4.0)
+                            .children(
+                                visible
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(display, (index, _))| {
+                                        TextBlock::new()
+                                            .grid_column(display as i32)
+                                            .text(row.cells[*index].text.clone())
+                                            .font_size(12.0)
+                                            .text_trimming(TextTrimming::CharacterEllipsis)
+                                            .margin(Thickness::xy(2.0, 8.0))
+                                            .into()
+                                    })
+                                    .collect::<Vec<View>>(),
+                            ),
+                    )
+                }))
+                .into()
+        };
+        ScrollViewer::new()
+            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+            .content(
+                Grid::new()
+                    .width(width + 32.0)
+                    .rows([GridLength::Auto, GridLength::STAR])
+                    .row_spacing(6.0)
+                    .children((headers, Border::new().grid_row(1).content(table))),
+            )
             .into()
     }
     fn task_details(&self, id: u64, context: &ViewContext<Self>) -> View {
@@ -915,7 +1036,7 @@ impl Console {
                 "Use --record session.tcui to capture telemetry. Use --replay session.tcui for offline inspection.",
                 "Task histograms are recorded while that task's details are open.",
             ))),
-            Button::new().content("Save settings to console.toml").on_click(context.message(Message::Save)),
+            Button::new().content("Save application preferences").on_click(context.message(Message::Save)),
         ))).into()
     }
 }
@@ -1152,12 +1273,7 @@ fn help_view() -> View {
 }
 
 pub fn run(settings: Settings, record: Option<PathBuf>, replay: Option<PathBuf>) -> Result<()> {
-    let worker = Arc::new(Worker::start(settings.clone(), record, replay)?);
-    App::run_component_with_policy::<Console>(
-        Launch { settings, worker },
-        WindowPolicy::new().minimum_client_size(1000.0, 640.0),
-    )?;
-    Ok(())
+    crate::windows_workbench::run(settings, record, replay)
 }
 pub fn show_error(error: &str) {
     let text: Vec<u16> = error.encode_utf16().chain(Some(0)).collect();

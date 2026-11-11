@@ -12,7 +12,7 @@ use std::{
     path::Path,
 };
 
-const MAGIC: &[u8; 8] = b"TCUI\x01\0\0\0";
+pub(crate) const MAGIC: &[u8; 8] = b"TCUI\x02\0\0\0";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 pub struct Recorder(BufWriter<File>);
 
@@ -47,6 +47,23 @@ impl Recorder {
     pub fn reset(&mut self) -> Result<()> {
         self.frame(3, &[])
     }
+    pub fn session(&mut self, target: &str) -> Result<()> {
+        self.reset()?;
+        self.frame(
+            4,
+            &serde_json::to_vec(&crate::investigation::SessionMetadata {
+                target: Some(target.into()),
+            })?,
+        )
+    }
+    pub(crate) fn raw_frame(&mut self, kind: u8, bytes: &[u8]) -> Result<()> {
+        self.frame(kind, bytes)
+    }
+    pub fn flush(&mut self) -> Result<()> {
+        self.0.flush()?;
+        self.0.get_ref().sync_all()?;
+        Ok(())
+    }
     pub fn update(&mut self, update: &Update) -> Result<()> {
         self.frame(1, &update.encode_to_vec())
     }
@@ -62,7 +79,7 @@ pub fn replay(path: &Path, settings: &Settings) -> Result<Snapshot> {
     reader
         .read_exact(&mut header)
         .context("Truncated recording header")?;
-    if &header != MAGIC {
+    if &header != MAGIC && &header != b"TCUI\x01\0\0\0" {
         bail!(
             "Not a Console UI v1 recording. console-subscriber raw tracing recordings use a different format."
         );
@@ -92,8 +109,15 @@ pub fn replay(path: &Path, settings: &Settings) -> Result<Snapshot> {
             }
             2 => accumulator.apply_details(TaskDetails::decode(bytes.as_slice())?),
             3 if length == 0 => accumulator = Accumulator::default(),
+            4 => {
+                let _: crate::investigation::SessionMetadata = serde_json::from_slice(&bytes)?;
+            }
             tag => bail!("Unknown recording frame type {tag}"),
         }
     }
-    Ok(accumulator.snapshot(&settings.warnings))
+    let mut snapshot = accumulator.snapshot(&settings.warnings);
+    for task in &mut snapshot.tasks {
+        task.lint_with(&settings.warnings, &settings.lint_thresholds);
+    }
+    Ok(snapshot)
 }

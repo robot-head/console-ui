@@ -1,11 +1,19 @@
 [package]
 name = "console-ui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native Windows 11 diagnostics for Tokio tasks and runtime resources"
 license = "MIT"
 default-run = "console-ui"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[workspace]
+members = ["platforms/linux"]
+default-members = ["."]
+resolver = "3"
 
 [features]
 default = ["self-contained", "tls"]
@@ -13,6 +21,9 @@ self-contained = []
 tls = ["tonic/tls-ring", "tonic/tls-native-roots"]
 
 [dependencies]
+directories = "6"
+shlex = "1"
+tempfile = "3"
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -24,10 +35,12 @@ prost-types = "0.14"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "signal", "net", "macros", "tracing"] }
+tokio-stream = "0.1"
 toml = "0.9"
 tonic = { version = "0.14", features = ["transport"] }
 
 [target.'cfg(windows)'.dependencies]
+rfd = { version = "0.17", default-features = false }
 windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "0cfb708054687e5bc32c596a98cfcf1395344eab" }
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
 

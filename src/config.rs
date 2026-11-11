@@ -78,6 +78,45 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Action {
+    /// Evaluate diagnostic budgets against a recording or a live observation interval.
+    Check {
+        #[command(flatten)]
+        options: crate::automation::CheckOptions,
+    },
+    /// Compare two captures using interval-normalized metrics.
+    Compare {
+        baseline: PathBuf,
+        current: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        baseline_session: usize,
+        #[arg(long, default_value_t = 0)]
+        current_session: usize,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// List the independently recorded connection sessions.
+    Sessions { input: PathBuf },
+    /// Export a filtered recording snapshot or self-contained report.
+    Export {
+        input: PathBuf,
+        output: PathBuf,
+        #[arg(long, default_value = "html")]
+        format: String,
+        #[arg(long, default_value = "tasks")]
+        table: String,
+        #[arg(long, default_value = "")]
+        query: String,
+        #[arg(long, default_value_t = 0)]
+        session: usize,
+        #[arg(long)]
+        at_ns: Option<u64>,
+        #[arg(long, value_delimiter = ',')]
+        redact_fields: Vec<String>,
+        #[arg(long)]
+        redact_paths: bool,
+        #[arg(long)]
+        redact_endpoint: bool,
+    },
     /// Print the effective configuration as TOML.
     GenConfig,
     /// Generate shell completions (including PowerShell).
@@ -100,6 +139,37 @@ pub struct Settings {
     pub palette: Palette,
     pub ascii_only: bool,
     pub no_colors: bool,
+    pub lint_thresholds: LintThresholds,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LintThresholds {
+    pub self_wake_percent: u8,
+    pub never_yielded_ns: u64,
+    pub large_future_bytes: u64,
+}
+impl Default for LintThresholds {
+    fn default() -> Self {
+        Self {
+            self_wake_percent: 50,
+            never_yielded_ns: 1_000_000_000,
+            large_future_bytes: 1024,
+        }
+    }
+}
+impl LintThresholds {
+    pub fn validate(&self) -> Result<()> {
+        if self.self_wake_percent > 100
+            || self.never_yielded_ns == 0
+            || self.large_future_bytes == 0
+        {
+            bail!(
+                "Lint thresholds require a self-wake percentage from 0 to 100 and positive duration/size limits"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for Settings {
@@ -111,6 +181,7 @@ impl Default for Settings {
             palette: Palette::System,
             ascii_only: false,
             no_colors: false,
+            lint_thresholds: LintThresholds::default(),
         }
     }
 }
@@ -127,7 +198,10 @@ impl Settings {
                     .with_context(|| format!("Read {}", path.display()))?,
             )
             .with_context(|| format!("Parse {}", path.display()))?,
-            None => Self::default(),
+            None => {
+                let path = crate::preferences::Preferences::path()?;
+                crate::preferences::Preferences::load(&path)?.settings
+            }
         };
         if let Some(target) = &cli.target {
             settings.target.clone_from(target);
@@ -146,6 +220,7 @@ impl Settings {
         }
         validate_target(&settings.target)?;
         settings.retention()?;
+        settings.lint_thresholds.validate()?;
         Ok(settings)
     }
 

@@ -9,7 +9,7 @@ use hdrhistogram::{Histogram, serialization::Deserializer};
 use prost_types::{Duration as ProtoDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Lint;
+use crate::config::{Lint, LintThresholds};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
@@ -35,6 +35,8 @@ pub struct TaskRow {
     pub target: String,
     pub location: String,
     pub fields: String,
+    #[serde(default)]
+    pub span_fields: BTreeMap<String, String>,
     pub blocking: bool,
     pub state: TaskState,
     pub timing: Timing,
@@ -57,11 +59,16 @@ impl TaskRow {
     }
 
     pub fn lint(&mut self, enabled: &BTreeSet<Lint>) {
+        self.lint_with(enabled, &LintThresholds::default());
+    }
+    pub fn lint_with(&mut self, enabled: &BTreeSet<Lint>, thresholds: &LintThresholds) {
         self.warnings = enabled
             .iter()
             .copied()
             .filter(|lint| match lint {
-                Lint::SelfWakes => !self.blocking && self.self_wake_percent() > 50.0,
+                Lint::SelfWakes => {
+                    !self.blocking && self.self_wake_percent() > thresholds.self_wake_percent as f64
+                }
                 Lint::LostWaker => {
                     !self.blocking
                         && self.state == TaskState::Idle
@@ -72,14 +79,17 @@ impl TaskRow {
                     !self.blocking
                         && self.state == TaskState::Running
                         && self.timing.polls <= 1
-                        && self.timing.busy >= 1_000_000_000
+                        && self.timing.busy >= thresholds.never_yielded_ns
                 }
                 Lint::AutoBoxedFuture => self
                     .size_bytes
                     .zip(self.original_size_bytes)
                     .is_some_and(|(size, original)| size != original),
                 Lint::LargeFuture => {
-                    !self.blocking && self.size_bytes.is_some_and(|size| size >= 1024)
+                    !self.blocking
+                        && self
+                            .size_bytes
+                            .is_some_and(|size| size >= thresholds.large_future_bytes)
                 }
             })
             .collect();
@@ -130,6 +140,8 @@ pub struct Distribution {
     pub high_outliers: u64,
     pub highest_outlier: Option<u64>,
     pub error: Option<String>,
+    #[serde(skip)]
+    pub raw_histogram: Vec<u8>,
 }
 
 impl Distribution {
@@ -148,6 +160,10 @@ impl Distribution {
         high_outliers: u64,
         highest_outlier: Option<u64>,
     ) -> Self {
+        use hdrhistogram::serialization::Serializer;
+        let mut raw_histogram = Vec::new();
+        let _ =
+            hdrhistogram::serialization::V2Serializer::new().serialize(&hist, &mut raw_histogram);
         let max = hist.max();
         // Logarithmic buckets keep long latency tails visible without rendering thousands of bars.
         let mut bins = BTreeMap::<u64, u64>::new();
@@ -173,6 +189,7 @@ impl Distribution {
             high_outliers,
             highest_outlier,
             error: None,
+            raw_histogram,
         }
     }
 
@@ -183,11 +200,40 @@ impl Distribution {
             hist.highest_outlier,
         )
     }
+    pub fn difference(&self, baseline: &Self) -> Self {
+        let decode =
+            |bytes: &[u8]| Deserializer::new().deserialize::<u64, _>(&mut Cursor::new(bytes));
+        let difference = (|| -> anyhow::Result<Self> {
+            anyhow::ensure!(
+                self.error.is_none() && baseline.error.is_none(),
+                "Histogram is incomplete"
+            );
+            let mut end = decode(&self.raw_histogram)?;
+            let start = decode(&baseline.raw_histogram)?;
+            end.subtract(&start)?;
+            anyhow::ensure!(
+                self.high_outliers >= baseline.high_outliers,
+                "Histogram counter reset"
+            );
+            Ok(Self::from_histogram(
+                end,
+                self.high_outliers - baseline.high_outliers,
+                self.highest_outlier
+                    .filter(|value| Some(*value) > baseline.highest_outlier),
+            ))
+        })();
+        difference.unwrap_or_else(|e| Self {
+            error: Some(format!("Interval histogram unavailable: {e:#}")),
+            ..Default::default()
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TaskDetails {
     pub id: u64,
+    #[serde(default)]
+    pub updated_at: u64,
     pub poll: Distribution,
     pub scheduled: Distribution,
 }
@@ -203,7 +249,7 @@ pub struct Snapshot {
     pub details: BTreeMap<u64, TaskDetails>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Accumulator {
     now: u64,
     updates: u64,
@@ -217,6 +263,79 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
+    pub fn wire_details(&self) -> Vec<tasks::TaskDetails> {
+        let histogram = |d: &Distribution| tasks::DurationHistogram {
+            raw_histogram: d.raw_histogram.clone(),
+            max_value: d.max,
+            high_outliers: d.high_outliers,
+            highest_outlier: d.highest_outlier,
+        };
+        self.details
+            .values()
+            .map(|d| tasks::TaskDetails {
+                task_id: Some(common::Id { id: d.id }),
+                now: Some(Timestamp {
+                    seconds: (d.updated_at / 1_000_000_000) as i64,
+                    nanos: (d.updated_at % 1_000_000_000) as i32,
+                }),
+                poll_times_histogram: (!d.poll.raw_histogram.is_empty()).then(|| {
+                    tasks::task_details::PollTimesHistogram::Histogram(histogram(&d.poll))
+                }),
+                scheduled_times_histogram: (!d.scheduled.raw_histogram.is_empty())
+                    .then(|| histogram(&d.scheduled)),
+            })
+            .collect()
+    }
+    pub fn wire_snapshot(&self) -> instrument::Update {
+        instrument::Update {
+            now: Some(Timestamp {
+                seconds: (self.now / 1_000_000_000) as i64,
+                nanos: (self.now % 1_000_000_000) as i32,
+            }),
+            new_metadata: Some(common::RegisterMetadata {
+                metadata: self
+                    .metadata
+                    .iter()
+                    .map(|(&id, value)| common::register_metadata::NewMetadata {
+                        id: Some(common::MetaId { id }),
+                        metadata: Some(value.clone()),
+                    })
+                    .collect(),
+            }),
+            task_update: Some(tasks::TaskUpdate {
+                new_tasks: self.tasks.values().map(|(t, _)| t.clone()).collect(),
+                stats_update: self.tasks.iter().map(|(&id, (_, s))| (id, *s)).collect(),
+                dropped_events: 0,
+            }),
+            resource_update: Some(resources::ResourceUpdate {
+                new_resources: self.resources.values().map(|(r, _)| r.clone()).collect(),
+                stats_update: self
+                    .resources
+                    .iter()
+                    .map(|(&id, (_, s))| (id, s.clone()))
+                    .collect(),
+                new_poll_ops: self
+                    .readiness
+                    .iter()
+                    .map(|(&id, &ready)| resources::PollOp {
+                        async_op_id: Some(common::Id { id }),
+                        is_ready: ready,
+                        ..Default::default()
+                    })
+                    .collect(),
+                dropped_events: 0,
+            }),
+            async_op_update: Some(async_ops::AsyncOpUpdate {
+                new_async_ops: self.ops.values().map(|(o, _)| o.clone()).collect(),
+                stats_update: self
+                    .ops
+                    .iter()
+                    .map(|(&id, (_, s))| (id, s.clone()))
+                    .collect(),
+                dropped_events: 0,
+            }),
+        }
+    }
     pub fn apply(&mut self, update: instrument::Update) {
         if let Some(now) = update.now.as_ref().and_then(timestamp) {
             self.now = self.now.max(now);
@@ -270,6 +389,7 @@ impl Accumulator {
     }
 
     pub fn apply_details(&mut self, details: tasks::TaskDetails) {
+        let updated_at = details.now.as_ref().and_then(timestamp).unwrap_or(self.now);
         let Some(id) = details.task_id else {
             return;
         };
@@ -291,6 +411,7 @@ impl Accumulator {
             id.id,
             TaskDetails {
                 id: id.id,
+                updated_at,
                 poll,
                 scheduled,
             },
@@ -408,6 +529,7 @@ impl Accumulator {
                         .map(|(k, v)| format!("{k}={v}"))
                         .collect::<Vec<_>>()
                         .join("  "),
+                    span_fields: fields.clone(),
                     blocking,
                     state,
                     timing: timing(
