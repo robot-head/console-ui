@@ -1,0 +1,38 @@
+name: Signing checks
+on:
+  push:
+    branches: [master, codex/signed-distribution]
+    paths: ['scripts/**', '.github/actions/**', '.github/workflows/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: signing-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  keyless:
+    # This probe signs only a public test fixture. PR code gets no OIDC token.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      - name: Verify GitHub keyless identity and reject altered content
+        env:
+          EXPECTED_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/signing-checks.yml@${{ github.ref }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signature-probe"
+          cp README.md "$RUNNER_TEMP/signature-probe/README.md"
+          bash scripts/sign-release-assets.sh "$RUNNER_TEMP/signature-probe"
+          bash scripts/verify-release-signatures.sh "$RUNNER_TEMP/signature-probe" "$EXPECTED_IDENTITY" "$GITHUB_SHA" "$GITHUB_REPOSITORY"
+          printf '\ntampered\n' >> "$RUNNER_TEMP/signature-probe/README.md"
+          if bash scripts/verify-release-signatures.sh "$RUNNER_TEMP/signature-probe" "$EXPECTED_IDENTITY" "$GITHUB_SHA" "$GITHUB_REPOSITORY"; then
+            echo 'Tampered asset was accepted' >&2
+            exit 1
+          fi

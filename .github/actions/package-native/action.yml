@@ -1,0 +1,188 @@
+name: Build and verify native distribution
+description: Package a native application, optionally require platform signing, and stage verified assets.
+inputs:
+  platform:
+    description: Release platform
+    required: true
+  version:
+    description: Validated application version
+    required: true
+  source_sha:
+    description: Expected checked-out source revision
+    required: true
+  signed:
+    description: Require trusted platform signing and keyless asset signatures
+    required: true
+  identity:
+    description: Expected Sigstore workflow identity
+    default: ''
+  macos_certificate:
+    description: Base64 Developer ID PKCS12 secret, supplied only to macOS signed jobs
+    default: ''
+  macos_password:
+    description: Developer ID PKCS12 password secret
+    default: ''
+  macos_notary_key:
+    description: Base64 App Store Connect API private key secret
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+    - name: Check source and signing configuration before building
+      shell: python
+      env:
+        EXPECTED_SOURCE: ${{ inputs.source_sha }}
+        RELEASE_PLATFORM: ${{ inputs.platform }}
+        DISTRIBUTION_SIGNED: ${{ inputs.signed }}
+        MACOS_CERTIFICATE_P12_BASE64: ${{ inputs.macos_certificate }}
+        MACOS_CERTIFICATE_PASSWORD: ${{ inputs.macos_password }}
+        MACOS_NOTARY_KEY_P8_BASE64: ${{ inputs.macos_notary_key }}
+      run: |
+        import os, subprocess
+        assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == os.environ['EXPECTED_SOURCE'], 'Checkout differs from validated source'
+        assert os.environ['DISTRIBUTION_SIGNED'] in ('true', 'false'), 'Invalid signing mode'
+        if os.environ['DISTRIBUTION_SIGNED'] == 'true':
+            subprocess.run(['python3' if os.name != 'nt' else 'python', 'scripts/release_assets.py', 'preflight', '--platform', os.environ['RELEASE_PLATFORM']], check=True)
+    - uses: ./.github/actions/setup-linux-desktop
+      if: runner.os == 'Linux'
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: ilammy/msvc-dev-cmd@v1
+      if: runner.os == 'Windows'
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: release-${{ inputs.platform }}
+    - shell: bash
+      run: cargo build --locked --example instrumented -p console-ui
+    - name: Stage Windows self-contained application
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: ./scripts/package-windows.ps1 -Architecture x64 -StageOnly
+    - name: Select only project-owned Windows binaries
+      if: runner.os == 'Windows' && inputs.signed == 'true'
+      id: windows_files
+      shell: pwsh
+      run: |
+        $files = @((Resolve-Path 'dist/console-ui-win-x64/console-ui.exe').Path)
+        if (Test-Path 'dist/console-ui-win-x64/console_ui.dll') { $files += (Resolve-Path 'dist/console-ui-win-x64/console_ui.dll').Path }
+        "files<<SIGNING_FILES" | Add-Content $env:GITHUB_OUTPUT
+        $files | Add-Content $env:GITHUB_OUTPUT
+        "SIGNING_FILES" | Add-Content $env:GITHUB_OUTPUT
+    - name: Authenticate to Azure using GitHub OIDC
+      if: runner.os == 'Windows' && inputs.signed == 'true'
+      uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+      with:
+        client-id: ${{ env.AZURE_CLIENT_ID }}
+        tenant-id: ${{ env.AZURE_TENANT_ID }}
+        subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+    - name: Authenticode sign and timestamp application binaries
+      if: runner.os == 'Windows' && inputs.signed == 'true'
+      uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+      with:
+        endpoint: ${{ env.AZURE_SIGNING_ENDPOINT }}
+        signing-account-name: ${{ env.AZURE_SIGNING_ACCOUNT }}
+        certificate-profile-name: ${{ env.AZURE_CERTIFICATE_PROFILE }}
+        files: ${{ steps.windows_files.outputs.files }}
+        file-digest: SHA256
+        timestamp-rfc3161: http://timestamp.acs.microsoft.com
+        timestamp-digest: SHA256
+        exclude-environment-credential: true
+        exclude-workload-identity-credential: true
+        exclude-managed-identity-credential: true
+        exclude-shared-token-cache-credential: true
+        exclude-visual-studio-credential: true
+        exclude-visual-studio-code-credential: true
+        exclude-azure-cli-credential: false
+        exclude-azure-powershell-credential: true
+        exclude-azure-developer-cli-credential: true
+        exclude-interactive-browser-credential: true
+    - name: Archive and test extracted Windows package
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        DISTRIBUTION_SIGNED: ${{ inputs.signed }}
+      run: |
+        $signed = $env:DISTRIBUTION_SIGNED -eq 'true'
+        ./scripts/package-windows.ps1 -Architecture x64 -ArchiveOnly -RequireSigned:$signed
+        $extracted = Join-Path $env:RUNNER_TEMP 'release-windows'
+        Expand-Archive dist/console-ui-win-x64.zip -DestinationPath $extracted
+        if ($signed) { ./scripts/verify-windows-signatures.ps1 -PackageRoot $extracted -ExpectedSubject $env:WINDOWS_SIGNER_SUBJECT }
+        ./scripts/smoke-windows.ps1 -Executable (Join-Path $extracted 'console-ui.exe')
+    - name: Package and test extracted Linux archive
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        bash scripts/package-linux.sh
+        extracted="$RUNNER_TEMP/release-linux"
+        mkdir -p "$extracted"
+        tar -xzf dist/console-ui-linux-x86_64.tar.gz -C "$extracted"
+        "$extracted/bin/console-ui" --help >/dev/null
+        bash scripts/smoke-linux.sh x11 "$extracted/bin/console-ui-gtk"
+        bash scripts/smoke-linux.sh wayland "$extracted/bin/console-ui-gtk"
+    - name: Sign, notarize, staple, package, and test macOS application
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        DISTRIBUTION_SIGNED: ${{ inputs.signed }}
+        MACOS_CERTIFICATE_P12_BASE64: ${{ inputs.macos_certificate }}
+        MACOS_CERTIFICATE_PASSWORD: ${{ inputs.macos_password }}
+        MACOS_NOTARY_KEY_P8_BASE64: ${{ inputs.macos_notary_key }}
+      run: |
+        mode=preview
+        if [[ "$DISTRIBUTION_SIGNED" == true ]]; then mode=signed; fi
+        bash scripts/package-macos.sh "$mode"
+        extracted="$RUNNER_TEMP/release-macos"
+        mkdir -p "$extracted"
+        ditto -x -k dist/console-ui-macos-arm64.zip "$extracted"
+        codesign --verify --deep --strict "$extracted/Console UI.app"
+        if [[ "$DISTRIBUTION_SIGNED" == true ]]; then
+          bash scripts/verify-macos-signature.sh "$extracted/Console UI.app" "$MACOS_TEAM_ID"
+        fi
+        "$extracted/Console UI.app/Contents/MacOS/console-ui" --help >/dev/null
+        bash scripts/smoke-macos.sh "$extracted/Console UI.app/Contents/MacOS/ConsoleUI"
+    - name: Stage final archive, checksum, and source manifest
+      shell: python
+      env:
+        RELEASE_PLATFORM: ${{ inputs.platform }}
+        RELEASE_VERSION: ${{ inputs.version }}
+        SOURCE_SHA: ${{ inputs.source_sha }}
+        DISTRIBUTION_SIGNED: ${{ inputs.signed }}
+        SIGNING_IDENTITY: ${{ inputs.identity }}
+      run: |
+        import os, subprocess, sys
+        platform = os.environ['RELEASE_PLATFORM']
+        source = {'windows-x64': 'dist/console-ui-win-x64.zip', 'linux-x86_64': 'dist/console-ui-linux-x86_64.tar.gz', 'macos-arm64': 'dist/console-ui-macos-arm64.zip'}[platform]
+        signed = os.environ['DISTRIBUTION_SIGNED'] == 'true'
+        command = [sys.executable, 'scripts/release_assets.py', 'stage', '--platform', platform, '--version', os.environ['RELEASE_VERSION'], '--source-sha', os.environ['SOURCE_SHA'], '--archive', source, '--distribution', 'signed' if signed else 'preview', '--identity', os.environ['SIGNING_IDENTITY']]
+        if signed and platform != 'linux-x86_64':
+            command += ['--native-evidence', 'dist/signing-evidence/' + ('windows.json' if platform == 'windows-x64' else 'macos.json')]
+        subprocess.run(command, check=True)
+    - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      if: inputs.signed == 'true'
+      with:
+        cosign-release: v3.1.4
+    - name: Sign and verify all final asset bytes with Sigstore
+      if: inputs.signed == 'true'
+      shell: bash
+      env:
+        SIGNING_IDENTITY: ${{ inputs.identity }}
+        SOURCE_SHA: ${{ inputs.source_sha }}
+      run: |
+        bash scripts/sign-release-assets.sh dist/release
+        bash scripts/verify-release-signatures.sh dist/release "$SIGNING_IDENTITY" "$SOURCE_SHA" "$GITHUB_REPOSITORY"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: release-package-${{ inputs.platform }}
+        path: dist/release/*
+        if-no-files-found: error
+        retention-days: 30
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: release-smoke-${{ inputs.platform }}
+        path: |
+          dist/smoke-*
+          dist/signing-evidence/*.json
+        retention-days: 14

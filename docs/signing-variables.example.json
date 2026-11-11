@@ -1,0 +1,12 @@
+{
+  "AZURE_CLIENT_ID": "<Entra application client ID>",
+  "AZURE_TENANT_ID": "<Entra directory ID>",
+  "AZURE_SUBSCRIPTION_ID": "<Azure subscription ID>",
+  "AZURE_SIGNING_ENDPOINT": "https://eus.codesigning.azure.net/",
+  "AZURE_SIGNING_ACCOUNT": "<Artifact Signing account name>",
+  "AZURE_CERTIFICATE_PROFILE": "<PublicTrust certificate profile name>",
+  "WINDOWS_SIGNER_SUBJECT": "<exact X.509 Subject of the application's signing certificate>",
+  "MACOS_TEAM_ID": "<ten-character Apple developer team ID>",
+  "MACOS_NOTARY_KEY_ID": "<App Store Connect API key ID>",
+  "MACOS_NOTARY_ISSUER_ID": "<App Store Connect API issuer UUID>"
+}
