@@ -71,7 +71,13 @@ try {
         [NativeSmokeWindow]::SetForegroundWindow($app.MainWindowHandle) | Out-Null
         [NativeSmokeWindow]::GetForegroundWindow() -eq $app.MainWindowHandle
     } 'foreground native window for keyboard input' | Out-Null
-    Wait-For { try { (Find-Name 'Inspect selected').SetFocus(); $true } catch { $false } } 'keyboard command focus after native layout' | Out-Null
+    Wait-For {
+        try {
+            $row = $table.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $itemCondition)
+            $row.SetFocus()
+            $true
+        } catch { $false }
+    } 'native row keyboard focus after layout' | Out-Null
     Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait('{END}')
     Wait-For {

@@ -345,6 +345,8 @@ impl Component for Console {
             if editing {
                 return false;
             }
+            // Let the native list handle Up/Down and Home/End so selection,
+            // container realization, and scrolling advance together.
             let recognized = matches!(
                 event.key,
                 VirtualKey::T
@@ -359,12 +361,8 @@ impl Component for Console {
                     | VirtualKey::SPACE
                     | VirtualKey::ESCAPE
                     | VirtualKey::ENTER
-                    | VirtualKey::UP
-                    | VirtualKey::DOWN
                     | VirtualKey::LEFT
                     | VirtualKey::RIGHT
-                    | VirtualKey::HOME
-                    | VirtualKey::END
             );
             if recognized
                 && !event.modifiers.contains(InputModifiers::ALT)
