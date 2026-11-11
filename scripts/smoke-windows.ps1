@@ -78,7 +78,7 @@ try {
         try {
             $row = $table.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $itemCondition)
             $row.SetFocus()
-            $true
+            $row.Current.HasKeyboardFocus
         } catch { $false }
     } 'native row keyboard focus after layout' | Out-Null
     Start-Sleep -Milliseconds 200
