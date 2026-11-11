@@ -64,12 +64,18 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_PROFILE_DEV_DEBUG: 0
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev xvfb dbus-x11 weston
+      - name: Install GTK and display-test dependencies
+        timeout-minutes: 8
+        run: |
+          sudo -E apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo -E apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends libgtk-4-dev xvfb dbus-x11 weston
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked -p console-ui-gtk -- -D warnings
       - run: cargo build --locked --example instrumented -p console-ui
