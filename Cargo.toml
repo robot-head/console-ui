@@ -2,5 +2,48 @@
 name = "console-ui"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
+description = "Native Windows 11 diagnostics for Tokio tasks and runtime resources"
+license = "MIT"
+default-run = "console-ui"
+
+[features]
+default = ["self-contained", "tls"]
+self-contained = []
+tls = ["tonic/tls-ring", "tonic/tls-native-roots"]
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+console-api = "0.9"
+hdrhistogram = "7.5"
+humantime = "2"
+prost = "0.14"
+prost-types = "0.14"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "signal", "net", "macros", "tracing"] }
+toml = "0.9"
+tonic = { version = "0.14", features = ["transport"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-reactor = { git = "https://github.com/microsoft/windows-rs", rev = "0cfb708054687e5bc32c596a98cfcf1395344eab" }
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+windows-reactor-setup = { git = "https://github.com/microsoft/windows-rs", rev = "0cfb708054687e5bc32c596a98cfcf1395344eab" }
+
+[dev-dependencies]
+console-subscriber = "0.5"
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[[example]]
+name = "instrumented"
+path = "examples/instrumented.rs"

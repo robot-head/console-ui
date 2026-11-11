@@ -1,0 +1,42 @@
+name: Verify and package Windows app
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: ilammy/msvc-dev-cmd@v1
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - name: Create self-contained x64 package
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - name: Build instrumented target
+        run: cargo build --locked --example instrumented
+      - name: Exercise packaged native UI
+        shell: pwsh
+        run: ./scripts/smoke-windows.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: console-ui-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/smoke-*.png
+          if-no-files-found: error
